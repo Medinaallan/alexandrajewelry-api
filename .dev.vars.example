@@ -1,0 +1,7 @@
+# Copy this file to .dev.vars and fill in your values
+# .dev.vars is loaded automatically by `wrangler dev` and by drizzle-kit
+
+DATABASE_URL=postgresql://user:password@ep-xxx.neon.tech/neondb?sslmode=require
+ADMIN_PASSWORD=alexandra2026
+JWT_SECRET=change-this-to-a-long-random-string-in-production
+ALLOWED_ORIGINS=http://localhost:5174

@@ -1,0 +1,18 @@
+name = "alexandra-api"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+ALLOWED_ORIGINS = "https://alexandrajewelry.vercel.app"
+R2_PUBLIC_URL = "https://pub-1752cd9998ba43e1a1623e0b96e7d47c.r2.dev"
+
+[[r2_buckets]]
+binding = "IMAGES"
+bucket_name = "alexandra-jewelry-images"
+
+# Secrets — set with `wrangler secret put <NAME>`:
+#   DATABASE_URL
+#   ADMIN_PASSWORD
+#   JWT_SECRET
+ 
