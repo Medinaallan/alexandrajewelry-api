@@ -17,9 +17,15 @@ export const requireAuth = createMiddleware<{ Bindings: Bindings; Variables: Var
       c.set('userId', payload.sub as string);
       c.set('role', payload.role as string);
       c.set('username', payload.username as string);
-      await next();
     } catch {
       return c.json({ error: 'Invalid or expired token' }, 401);
     }
+    await next();
   }
 );
+
+/** Must run after requireAuth. Only users with the `admin` role pass. */
+export const requireAdmin = createMiddleware<{ Variables: Variables }>(async (c, next) => {
+  if (c.get('role') !== 'admin') return c.json({ error: 'Forbidden' }, 403);
+  await next();
+});

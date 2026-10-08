@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
+import { HTTPException } from 'hono/http-exception';
 import { auth } from './routes/auth';
 import { products } from './routes/products';
 import { categories } from './routes/categories';
@@ -46,5 +47,25 @@ app.route('/api/stock', stock);
 app.route('/api/sales', sales);
 
 app.get('/', (c) => c.json({ status: 'ok', service: 'Alexandra Jewelry API v2' }));
+
+app.notFound((c) => c.json({ error: 'Not found' }, 404));
+
+// Every unhandled error becomes a JSON response the frontend can show.
+app.onError((err, c) => {
+  if (err instanceof HTTPException) return err.getResponse();
+  if (err instanceof SyntaxError) return c.json({ error: 'Invalid request body' }, 400);
+
+  // Postgres error codes (the driver may expose them directly or as `cause`)
+  const code = (err as { code?: string }).code ?? (err as { cause?: { code?: string } }).cause?.code;
+  if (code === '23505') {
+    return c.json({ error: 'Ya existe un registro con ese código, nombre o usuario.' }, 409);
+  }
+  if (code === '23503') {
+    return c.json({ error: 'No se puede completar: el registro está relacionado con otros datos.' }, 409);
+  }
+
+  console.error(err);
+  return c.json({ error: 'Internal server error' }, 500);
+});
 
 export default app;

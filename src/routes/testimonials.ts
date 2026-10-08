@@ -3,11 +3,20 @@ import { eq } from 'drizzle-orm';
 import { getDb } from '../db';
 import { testimonialsTable } from '../db/schema';
 import { requireAuth } from '../middleware/auth';
+import { rateLimit } from '../middleware/rateLimit';
+import { parseFields, parseId } from '../utils/validate';
 
 type Bindings = { DATABASE_URL: string; JWT_SECRET: string };
 
 const VALID_STATUSES = ['pending', 'approved', 'rejected'] as const;
 type TestimonialStatus = (typeof VALID_STATUSES)[number];
+
+const testimonialSpec = {
+  name: { type: 'string', min: 1, max: 80 },
+  text: { type: 'string', min: 1, max: 1000 },
+  rating: { type: 'number', integer: true, min: 1, max: 5 },
+  location: { type: 'string', max: 80 },
+} as const;
 
 // ── Public router ─────────────────────────────────────────────────────────────
 
@@ -25,27 +34,20 @@ testimonials.get('/approved', async (c) => {
 });
 
 // POST /api/testimonials — visitor submits a new review (pending)
-testimonials.post('/', async (c) => {
+testimonials.post('/', rateLimit('PUBLIC_LIMITER'), async (c) => {
+  // email and productPurchased are collected by the form but not yet in the DB schema
+  const parsed = parseFields(await c.req.json<unknown>(), testimonialSpec, ['name', 'text']);
+  if (!parsed.ok) return c.json({ error: parsed.error }, 400);
+  const body = parsed.data;
   const db = getDb(c.env.DATABASE_URL);
-  const body = await c.req.json<{
-    name: string;
-    text: string;
-    rating?: number;
-    location?: string;
-    // email and productPurchased collected but not yet in DB schema
-  }>();
-
-  if (!body.name?.trim() || !body.text?.trim()) {
-    return c.json({ error: 'name and text are required' }, 400);
-  }
 
   const [row] = await db
     .insert(testimonialsTable)
     .values({
-      name: body.name.trim(),
-      text: body.text.trim(),
-      rating: Math.min(5, Math.max(1, body.rating ?? 5)),
-      location: body.location?.trim() ?? '',
+      name: body.name,
+      text: body.text,
+      rating: body.rating ?? 5,
+      location: body.location ?? '',
       status: 'pending',
     })
     .returning();
@@ -70,6 +72,8 @@ adminTestimonials.get('/', requireAuth, async (c) => {
 
 // PATCH /api/admin/testimonials/:id/status
 adminTestimonials.patch('/:id/status', requireAuth, async (c) => {
+  const id = parseId(c.req.param('id'));
+  if (!id) return c.json({ error: 'Not found' }, 404);
   const db = getDb(c.env.DATABASE_URL);
   const { status } = await c.req.json<{ status: string }>();
 
@@ -80,7 +84,7 @@ adminTestimonials.patch('/:id/status', requireAuth, async (c) => {
   const [row] = await db
     .update(testimonialsTable)
     .set({ status })
-    .where(eq(testimonialsTable.id, Number(c.req.param('id'))))
+    .where(eq(testimonialsTable.id, id))
     .returning();
   if (!row) return c.json({ error: 'Not found' }, 404);
   return c.json(row);
@@ -88,8 +92,10 @@ adminTestimonials.patch('/:id/status', requireAuth, async (c) => {
 
 // DELETE /api/admin/testimonials/:id
 adminTestimonials.delete('/:id', requireAuth, async (c) => {
+  const id = parseId(c.req.param('id'));
+  if (!id) return c.json({ error: 'Not found' }, 404);
   const db = getDb(c.env.DATABASE_URL);
-  await db.delete(testimonialsTable).where(eq(testimonialsTable.id, Number(c.req.param('id'))));
+  await db.delete(testimonialsTable).where(eq(testimonialsTable.id, id));
   return c.json({ success: true });
 });
 

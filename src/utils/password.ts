@@ -25,5 +25,9 @@ export async function verifyPassword(password: string, stored: string): Promise<
     256,
   );
   const hashHex = [...new Uint8Array(bits)].map((b) => b.toString(16).padStart(2, '0')).join('');
-  return hashHex === storedHash;
+  // Compare without exiting early so timing doesn't leak how much matched
+  if (hashHex.length !== storedHash.length) return false;
+  let diff = 0;
+  for (let i = 0; i < hashHex.length; i++) diff |= hashHex.charCodeAt(i) ^ storedHash.charCodeAt(i);
+  return diff === 0;
 }

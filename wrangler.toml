@@ -10,6 +10,20 @@ R2_PUBLIC_URL = "https://pub-1752cd9998ba43e1a1623e0b96e7d47c.r2.dev"
 [[r2_buckets]]
 binding = "IMAGES"
 bucket_name = "alexandra-jewelry-images"
+preview_bucket_name = "alexandra-jewelry-images"
+
+# Per-IP request limits (Workers Rate Limiting). `period` is in seconds.
+[[unsafe.bindings]]
+name = "LOGIN_LIMITER"
+type = "ratelimit"
+namespace_id = "1001"
+simple = { limit = 5, period = 60 }
+
+[[unsafe.bindings]]
+name = "PUBLIC_LIMITER"
+type = "ratelimit"
+namespace_id = "1002"
+simple = { limit = 10, period = 60 }
 
 # Secrets — set with `wrangler secret put <NAME>`:
 #   DATABASE_URL

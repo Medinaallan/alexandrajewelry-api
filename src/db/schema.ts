@@ -1,13 +1,20 @@
 import {
   pgTable,
   text,
-  doublePrecision,
   boolean,
   integer,
   serial,
   timestamp,
   jsonb,
+  customType,
 } from 'drizzle-orm/pg-core';
+
+// Money is stored as exact numeric(12,2) and exposed to the app as a number.
+const money = customType<{ data: number; driverData: string | number }>({
+  dataType: () => 'numeric(12, 2)',
+  fromDriver: (value) => Number(value),
+  toDriver: (value) => String(value),
+});
 
 // ─── Users ────────────────────────────────────────────────────────────────────
 
@@ -62,9 +69,9 @@ export const productsTable = pgTable('products', {
   subcategoryId: integer('subcategory_id').notNull().references(() => subcategoriesTable.id),
   description: text('description').notNull().default(''),
   descriptionEn: text('description_en').notNull().default(''),
-  cost: doublePrecision('cost'),          // optional, internal use
-  price: doublePrecision('price').notNull(),
-  tax: doublePrecision('tax').notNull().default(0),
+  cost: money('cost'),          // optional, internal use
+  price: money('price').notNull(),
+  tax: money('tax').notNull().default(0),
   stock: integer('stock').notNull().default(0),
   minStock: integer('min_stock').notNull().default(0),
   featured: boolean('featured').notNull().default(false),
@@ -118,8 +125,8 @@ export const salesTable = pgTable('sales', {
   productId: integer('product_id').notNull().references(() => productsTable.id),
   productName: text('product_name').notNull(),
   quantity: integer('quantity').notNull(),
-  unitPrice: doublePrecision('unit_price').notNull(),
-  total: doublePrecision('total').notNull(),
+  unitPrice: money('unit_price').notNull(),
+  total: money('total').notNull(),
   notes: text('notes').notNull().default(''),
   soldBy: text('sold_by').notNull().default(''),
   createdAt: timestamp('created_at').defaultNow().notNull(),
@@ -136,7 +143,7 @@ export const ordersTable = pgTable('orders', {
   notes: text('notes').notNull().default(''),
   paymentMethod: text('payment_method').notNull(),
   items: jsonb('items').notNull(),
-  total: doublePrecision('total').notNull(),
+  total: money('total').notNull(),
   status: text('status').notNull().default('pending'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });

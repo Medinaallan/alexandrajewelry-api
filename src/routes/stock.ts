@@ -3,11 +3,22 @@ import { eq, desc } from 'drizzle-orm';
 import { getDb } from '../db';
 import { stockProductsTable, productsTable } from '../db/schema';
 import { requireAuth } from '../middleware/auth';
+import { applyStockMovement, type MovementType } from '../db/inventory';
+import { parseFields, parseId } from '../utils/validate';
 
 type Bindings = { DATABASE_URL: string; JWT_SECRET: string };
 type Variables = { username: string };
 
 const stock = new Hono<{ Bindings: Bindings; Variables: Variables }>();
+
+const MOVEMENT_TYPES: readonly MovementType[] = ['entry', 'adjustment', 'return'];
+
+const movementSpec = {
+  productId: { type: 'number', integer: true, min: 1 },
+  quantity: { type: 'number', integer: true, min: -1_000_000, max: 1_000_000 },
+  type: { type: 'string', max: 20 },
+  notes: { type: 'string', min: 1, max: 500 },
+} as const;
 
 // All products with current stock levels
 stock.get('/products', requireAuth, async (c) => {
@@ -51,8 +62,9 @@ stock.get('/', requireAuth, async (c) => {
 
 // Movements for a specific product
 stock.get('/product/:productId', requireAuth, async (c) => {
+  const productId = parseId(c.req.param('productId'));
+  if (!productId) return c.json({ error: 'Not found' }, 404);
   const db = getDb(c.env.DATABASE_URL);
-  const productId = Number(c.req.param('productId'));
   const rows = await db
     .select()
     .from(stockProductsTable)
@@ -63,63 +75,24 @@ stock.get('/product/:productId', requireAuth, async (c) => {
 
 // Register a stock movement
 stock.post('/', requireAuth, async (c) => {
-  const db = getDb(c.env.DATABASE_URL);
-  const username = c.get('username');
-  const body = await c.req.json<{
-    productId: number;
-    quantity: number;
-    type?: string;
-    notes?: string;
-  }>();
+  const parsed = parseFields(await c.req.json<unknown>(), movementSpec, ['productId', 'quantity', 'notes']);
+  if (!parsed.ok) return c.json({ error: parsed.error }, 400);
+  const { productId, quantity, notes } = parsed.data;
 
-  if (!body.productId || body.quantity === undefined) {
-    return c.json({ error: 'productId and quantity are required' }, 400);
-  }
-  if (!body.notes || !body.notes.trim()) {
-    return c.json({ error: 'notes are required' }, 400);
-  }
+  const type = (parsed.data.type ?? 'entry') as MovementType;
+  if (!MOVEMENT_TYPES.includes(type)) return c.json({ error: 'Invalid movement type' }, 400);
+  // An adjustment sets the stock to `quantity`, so it can't be negative.
+  if (type === 'adjustment' && quantity < 0) return c.json({ error: 'quantity must be at least 0' }, 400);
 
-  const [product] = await db.select().from(productsTable).where(eq(productsTable.id, body.productId));
-  if (!product) return c.json({ error: 'Product not found' }, 404);
-
-  const type = body.type ?? 'entry';
-
-  // `quantity` stored on the movement always represents the actual change
-  // applied to the product's stock (positive = added, negative = removed),
-  // regardless of how the admin entered the value for each movement type.
-  let newStock: number;
-  let delta: number;
-  if (type === 'adjustment') {
-    // For adjustments, `body.quantity` is the new absolute stock value.
-    newStock = Math.max(0, body.quantity);
-    delta = newStock - product.stock;
-  } else if (type === 'return') {
-    // Returns always remove stock.
-    delta = -Math.abs(body.quantity);
-    newStock = Math.max(0, product.stock + delta);
-  } else {
-    // Entries always add stock.
-    delta = Math.abs(body.quantity);
-    newStock = product.stock + delta;
-  }
-
-  const [movement] = await db
-    .insert(stockProductsTable)
-    .values({
-      productId: body.productId,
-      quantity: delta,
-      type,
-      notes: body.notes,
-      createdBy: username ?? '',
-    })
-    .returning();
-
-  await db
-    .update(productsTable)
-    .set({ stock: newStock, updatedAt: new Date() })
-    .where(eq(productsTable.id, body.productId));
-
-  return c.json({ ...movement, newStock }, 201);
+  const movement = await applyStockMovement(getDb(c.env.DATABASE_URL), {
+    productId,
+    quantity,
+    type,
+    notes,
+    createdBy: c.get('username') ?? '',
+  });
+  if (!movement) return c.json({ error: 'Product not found' }, 404);
+  return c.json(movement, 201);
 });
 
 export { stock };

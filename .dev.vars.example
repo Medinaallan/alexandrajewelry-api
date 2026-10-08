@@ -2,6 +2,7 @@
 # .dev.vars is loaded automatically by `wrangler dev` and by drizzle-kit
 
 DATABASE_URL=postgresql://user:password@ep-xxx.neon.tech/neondb?sslmode=require
-ADMIN_PASSWORD=alexandra2026
+# Password given to the `admin` user by `npm run seed` (8+ characters). Pick your own.
+ADMIN_PASSWORD=change-me-before-seeding
 JWT_SECRET=change-this-to-a-long-random-string-in-production
 ALLOWED_ORIGINS=http://localhost:5174

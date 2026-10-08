@@ -4,14 +4,17 @@ import { eq } from 'drizzle-orm';
 import { getDb } from '../db';
 import { usersTable } from '../db/schema';
 import { verifyPassword } from '../utils/password';
+import { rateLimit } from '../middleware/rateLimit';
 
 type Bindings = { DATABASE_URL: string; JWT_SECRET: string };
 
 const auth = new Hono<{ Bindings: Bindings }>();
 
-auth.post('/login', async (c) => {
-  const { username, password } = await c.req.json<{ username: string; password: string }>();
-  if (!username || !password) return c.json({ error: 'Missing credentials' }, 400);
+auth.post('/login', rateLimit('LOGIN_LIMITER'), async (c) => {
+  const { username, password } = await c.req.json<{ username?: unknown; password?: unknown }>();
+  if (typeof username !== 'string' || typeof password !== 'string' || !username || !password) {
+    return c.json({ error: 'Missing credentials' }, 400);
+  }
 
   const db = getDb(c.env.DATABASE_URL);
   const [user] = await db.select().from(usersTable).where(eq(usersTable.username, username));

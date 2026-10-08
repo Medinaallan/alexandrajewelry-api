@@ -7,7 +7,9 @@
     "deploy": "wrangler deploy",
     "db:push": "drizzle-kit push",
     "db:studio": "drizzle-kit studio",
-    "seed": "tsx seed.ts"
+    "seed": "tsx seed.ts",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@neondatabase/serverless": "^0.10.4",
@@ -17,10 +19,12 @@
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250109.0",
+    "@electric-sql/pglite": "^0.5.8",
     "dotenv": "^16.4.7",
     "drizzle-kit": "^0.30.0",
     "tsx": "^4.19.2",
     "typescript": "^5.8.3",
+    "vitest": "^3.2.7",
     "wrangler": "^3.113.0"
   }
 }

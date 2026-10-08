@@ -1,7 +1,7 @@
 /**
  * Run once to initialize the database.
  * Usage: npx tsx seed.ts
- * Requires .dev.vars with DATABASE_URL set.
+ * Requires .dev.vars with DATABASE_URL and ADMIN_PASSWORD set.
  */
 import { config } from 'dotenv';
 config({ path: '.dev.vars' });
@@ -17,11 +17,18 @@ if (!databaseUrl) {
   process.exit(1);
 }
 
+// The admin password is never written in the code: it comes from .dev.vars
+const adminPassword = process.env.ADMIN_PASSWORD;
+if (!adminPassword || adminPassword.length < 8) {
+  console.error('ERROR: set ADMIN_PASSWORD (8+ characters) in .dev.vars');
+  process.exit(1);
+}
+
 const db = drizzle(neon(databaseUrl));
 
 async function seed() {
   console.log('▶ Creating default admin user...');
-  const passwordHash = await hashPassword('alexandra2026');
+  const passwordHash = await hashPassword(adminPassword!);
   await db
     .insert(usersTable)
     .values({
@@ -31,7 +38,7 @@ async function seed() {
       role: 'admin',
     })
     .onConflictDoNothing();
-  console.log('  ✓ Admin user ready  (username: admin / password: alexandra2026)');
+  console.log('  ✓ Admin user ready  (username: admin, password: the ADMIN_PASSWORD from .dev.vars)');
   console.log('\n✅ Seed complete!');
 }
 
