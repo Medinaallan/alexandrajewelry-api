@@ -20,6 +20,7 @@ export type SaleRow = {
   total: number;
   notes: string;
   soldBy: string;
+  orderId: number | null;
   createdAt: string;
 };
 
@@ -54,12 +55,31 @@ function toIso(value: unknown): string {
   return new Date(hasZone ? text : `${text}Z`).toISOString();
 }
 
+/** Thrown when an order's status was changed by someone else meanwhile. */
+export class OrderChangedError extends Error {
+  constructor() {
+    super('Order status changed');
+  }
+}
+
+/** Moves an order from one status to another in the same statement. */
+export type OrderTransition = { id: number; from: string; to: string };
+
 /**
  * Registers every line as a sale and takes the units out of stock.
  * All-or-nothing: if any product lacks stock, nothing is sold and
  * InsufficientStockError is thrown. `lines` must not repeat a product.
+ *
+ * With `order`, the sales are linked to that order and its status changes
+ * from `order.from` to `order.to` in the same statement. If the order is no
+ * longer in `order.from`, nothing happens and OrderChangedError is thrown.
  */
-export async function registerSales(db: SqlExecutor, lines: SaleLine[], soldBy: string): Promise<SaleRow[]> {
+export async function registerSales(
+  db: SqlExecutor,
+  lines: SaleLine[],
+  soldBy: string,
+  order?: OrderTransition,
+): Promise<SaleRow[]> {
   if (lines.length === 0) return [];
 
   const values = sql.join(
@@ -70,32 +90,43 @@ export async function registerSales(db: SqlExecutor, lines: SaleLine[], soldBy: 
     sql`, `,
   );
 
+  // Without an order, `ord` is a constant row so the guards below always pass.
+  const ord = order
+    ? sql`UPDATE orders SET status = ${order.to}::text WHERE id = ${order.id}::int AND status = ${order.from}::text RETURNING id`
+    : sql`SELECT NULL::int AS id`;
+
   try {
     // `upd` only touches products that still have enough stock. If that left
     // any line out, the division below hits zero and Postgres rolls back the
-    // whole statement, including the stock already taken by `upd`.
+    // whole statement, including the stock already taken by `upd` and the
+    // order status. Every line yields a row (LEFT JOIN), so the division
+    // always runs.
     const { rows } = await db.execute(sql`
-      WITH lines (product_id, quantity, unit_price, notes) AS (VALUES ${values}),
+      WITH ord AS (${ord}),
+      lines (product_id, quantity, unit_price, notes) AS (VALUES ${values}),
       upd AS (
         UPDATE products p
         SET stock = p.stock - l.quantity, updated_at = now()
         FROM lines l
-        WHERE p.id = l.product_id AND p.stock >= l.quantity
+        WHERE p.id = l.product_id AND p.stock >= l.quantity AND EXISTS (SELECT 1 FROM ord)
         RETURNING p.id, p.name, p.price
       )
-      INSERT INTO sales (product_id, product_name, quantity, unit_price, total, notes, sold_by)
+      INSERT INTO sales (product_id, product_name, quantity, unit_price, total, notes, sold_by, order_id)
       SELECT
         l.product_id,
-        u.name,
+        COALESCE(u.name, ''),
         l.quantity / (CASE WHEN (SELECT count(*) FROM upd) = (SELECT count(*) FROM lines) THEN 1 ELSE 0 END),
-        COALESCE(l.unit_price, u.price::numeric),
-        round(COALESCE(l.unit_price, u.price::numeric) * l.quantity, 2),
+        COALESCE(l.unit_price, u.price::numeric, 0),
+        round(COALESCE(l.unit_price, u.price::numeric, 0) * l.quantity, 2),
         l.notes,
-        ${soldBy}::text
+        ${soldBy}::text,
+        (SELECT id FROM ord LIMIT 1)
       FROM lines l
-      JOIN upd u ON u.id = l.product_id
+      LEFT JOIN upd u ON u.id = l.product_id
+      WHERE EXISTS (SELECT 1 FROM ord)
       RETURNING *
     `);
+    if (rows.length === 0 && order) throw new OrderChangedError();
     if (rows.length !== lines.length) throw new InsufficientStockError();
     return rows.map((r) => ({
       id: Number(r.id),
@@ -106,12 +137,56 @@ export async function registerSales(db: SqlExecutor, lines: SaleLine[], soldBy: 
       total: Number(r.total),
       notes: String(r.notes),
       soldBy: String(r.sold_by),
+      orderId: r.order_id == null ? null : Number(r.order_id),
       createdAt: toIso(r.created_at),
     }));
   } catch (err) {
     if ((err as { code?: string }).code === DIVISION_BY_ZERO) throw new InsufficientStockError();
     throw err;
   }
+}
+
+/**
+ * Undoes what registerSales did for an order: deletes its sales, puts the
+ * units back in stock and changes the order status, all in one statement.
+ * Throws OrderChangedError if the order is no longer in `order.from`.
+ * Returns how many units went back to stock.
+ */
+export async function releaseOrderStock(db: SqlExecutor, order: OrderTransition): Promise<number> {
+  const { rows } = await db.execute(sql`
+    WITH ord AS (
+      UPDATE orders SET status = ${order.to}::text
+      WHERE id = ${order.id}::int AND status = ${order.from}::text
+      RETURNING id
+    ),
+    del AS (
+      DELETE FROM sales s USING ord WHERE s.order_id = ord.id
+      RETURNING s.product_id, s.quantity
+    ),
+    back AS (
+      SELECT product_id, sum(quantity)::int AS quantity FROM del GROUP BY product_id
+    ),
+    upd AS (
+      UPDATE products p SET stock = p.stock + b.quantity, updated_at = now()
+      FROM back b WHERE p.id = b.product_id
+      RETURNING p.id
+    )
+    SELECT
+      (SELECT count(*) FROM ord)::int AS changed,
+      (SELECT COALESCE(sum(quantity), 0) FROM back)::int AS units
+  `);
+  if (Number(rows[0]?.changed) === 0) throw new OrderChangedError();
+  return Number(rows[0].units);
+}
+
+/** Changes an order status when no stock is involved. */
+export async function setOrderStatus(db: SqlExecutor, order: OrderTransition): Promise<void> {
+  const { rows } = await db.execute(sql`
+    UPDATE orders SET status = ${order.to}::text
+    WHERE id = ${order.id}::int AND status = ${order.from}::text
+    RETURNING id
+  `);
+  if (rows.length === 0) throw new OrderChangedError();
 }
 
 /**

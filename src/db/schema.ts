@@ -129,6 +129,8 @@ export const salesTable = pgTable('sales', {
   total: money('total').notNull(),
   notes: text('notes').notNull().default(''),
   soldBy: text('sold_by').notNull().default(''),
+  // Set when the sale comes from a web order (it took the order's stock)
+  orderId: integer('order_id').references(() => ordersTable.id),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 

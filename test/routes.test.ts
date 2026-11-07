@@ -150,6 +150,55 @@ describe('POST /api/orders', () => {
     expect((await call('/api/orders', { method: 'POST', body: '{nope' })).status).toBe(400);
   });
 
+  it('rejects quantities above the available stock', async () => {
+    const res = await call('/api/orders', json({ ...customer, items: [{ productId: 2, quantity: 3 }] }));
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { error: string }).error).toContain('Solo quedan 2');
+    await client.exec(`UPDATE products SET stock = 0 WHERE id = 2`);
+    const out = await call('/api/orders', json({ ...customer, items: [{ productId: 2, quantity: 1 }] }));
+    expect(((await out.json()) as { error: string }).error).toContain('agotado');
+  });
+
+  it('takes stock when paid and returns it when cancelled', async () => {
+    const stockOf = async (id: number) =>
+      (await client.query<{ stock: number }>('SELECT stock FROM products WHERE id = $1', [id])).rows[0].stock;
+    const patch = (status: string) =>
+      call('/api/orders/1/status', { method: 'PATCH', body: JSON.stringify({ status }) }, true);
+    await call('/api/orders', json({ ...customer, items: [{ productId: 1, quantity: 2 }, { productId: 2, quantity: 1 }] }));
+    expect(await stockOf(1)).toBe(5); // a new order only checks stock
+
+    expect((await patch('confirmed')).status).toBe(200);
+    expect(await stockOf(1)).toBe(5);
+
+    expect((await patch('paid')).status).toBe(200);
+    expect(await stockOf(1)).toBe(3);
+    expect(await stockOf(2)).toBe(1);
+    const sales = (await (await call('/api/sales', {}, true)).json()) as Array<Record<string, unknown>>;
+    expect(sales).toHaveLength(2);
+    expect(sales.find((s) => s.productId === 1)).toMatchObject({ orderId: 1, unitPrice: 120.5, total: 241, notes: 'Pedido #1' });
+
+    // paid -> shipped -> delivered keeps the stock as it is
+    expect((await patch('shipped')).status).toBe(200);
+    expect((await patch('delivered')).status).toBe(200);
+    expect(await stockOf(1)).toBe(3);
+
+    const cancelled = await patch('cancelled');
+    expect(await cancelled.json()).toMatchObject({ status: 'cancelled' });
+    expect(await stockOf(1)).toBe(5);
+    expect(await stockOf(2)).toBe(2);
+    expect(await (await call('/api/sales', {}, true)).json()).toEqual([]);
+  });
+
+  it('refuses to mark paid without enough stock', async () => {
+    await call('/api/orders', json({ ...customer, items: [{ productId: 2, quantity: 2 }] }));
+    await client.exec(`UPDATE products SET stock = 1 WHERE id = 2`);
+    const res = await call('/api/orders/1/status', { method: 'PATCH', body: JSON.stringify({ status: 'paid' }) }, true);
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { error: string }).error).toContain('Collar');
+    const [order] = (await (await call('/api/orders', {}, true)).json()) as Array<{ status: string }>;
+    expect(order.status).toBe('pending');
+  });
+
   it('keeps the order list and status changes behind login', async () => {
     expect((await call('/api/orders')).status).toBe(401);
     await call('/api/orders', json({ ...customer, items: [{ productId: 1, quantity: 1 }] }));
@@ -172,6 +221,18 @@ describe('products', () => {
     expect(ring.price).toBe(120.5);
     expect(ring.images.map((i) => i.filename)).toEqual(['a.png', 'b.png']);
     expect(products.find((p) => p.id === 2)!.images).toEqual([]);
+    expect(ring).not.toHaveProperty('cost');
+    expect(ring).not.toHaveProperty('minStock');
+  });
+
+  it('serves one product publicly without internal fields, and hides inactive ones', async () => {
+    const res = await call('/api/products/anillo');
+    expect(res.status).toBe(200);
+    const ring = (await res.json()) as Record<string, unknown>;
+    expect(ring).toMatchObject({ id: 1, stock: 5 });
+    expect(ring).not.toHaveProperty('cost');
+    expect((await call('/api/products/oculto')).status).toBe(404);
+    expect((await call('/api/products/3')).status).toBe(404);
   });
 
   it('only updates fields that are allowed', async () => {
@@ -183,9 +244,9 @@ describe('products', () => {
     expect(await res.json()).toMatchObject({ id: 1, price: 150, name: 'Anillo', nameEn: 'Ring', stock: 5 });
   });
 
-  it('keeps a translation the admin corrected by hand', async () => {
-    const res = await call('/api/products/1', { method: 'PUT', body: JSON.stringify({ nameEn: 'Gold band' }) }, true);
-    expect(await res.json()).toMatchObject({ name: 'Anillo', nameEn: 'Gold band' });
+  it('does not store English texts (the site is translated in the browser)', async () => {
+    const res = await call('/api/products/1', { method: 'PUT', body: JSON.stringify({ name: 'Anillo fino', nameEn: 'Gold band' }) }, true);
+    expect(await res.json()).toMatchObject({ name: 'Anillo fino', nameEn: 'Ring' });
   });
 
   it('rejects invalid values and unknown ids', async () => {
@@ -202,6 +263,64 @@ describe('products', () => {
       code: 'A1', name: 'Otro', nameEn: 'Other', slug: 'otro', categoryId: 1, subcategoryId: 1, price: 5,
     }), true);
     expect(res.status).toBe(409);
+  });
+});
+
+describe('POST /api/products/bulk', () => {
+  const bulk = (products: unknown[]) => call('/api/products/bulk', json({ products }), true);
+  const row = (extra: Record<string, unknown>) => ({ categoryId: 1, subcategoryId: 1, price: 10, ...extra });
+
+  it('creates every row, translating and building unique slugs', async () => {
+    const res = await bulk([
+      row({ row: 2, code: 'B1', name: 'Anillo', description: 'Oro rosa', stock: 3, featured: true }),
+      row({ row: 3, code: 'B2', name: 'Pulsera Año', cost: null, tax: 15 }),
+    ]);
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as { created: number; products: Array<Record<string, unknown>> };
+    expect(body.created).toBe(2);
+    expect(body.products[0]).toMatchObject({
+      code: 'B1', slug: 'anillo-2', description: 'Oro rosa', nameEn: '', descriptionEn: '', stock: 3, featured: true, active: true,
+    });
+    expect(body.products[1]).toMatchObject({ slug: 'pulsera-ano', description: '', tax: 15 });
+  });
+
+  it('inserts nothing and reports each bad row', async () => {
+    await client.exec(`INSERT INTO categories (name, slug) VALUES ('Collares', 'collares')`);
+    const res = await bulk([
+      row({ row: 2, code: 'OK1', name: 'Bien' }),
+      row({ row: 3, code: 'A1', name: 'Código existente' }),
+      row({ row: 4, code: 'OK1', name: 'Repetido' }),
+      row({ row: 5, code: 'Z1', name: 'Sin categoría', categoryId: 99, subcategoryId: 99 }),
+      row({ row: 6, code: 'Z2', name: 'Sub ajena', categoryId: 2 }),
+      row({ row: 7, code: 'Z3', name: 'Sin precio', price: undefined }),
+    ]);
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { errors: Array<{ row: number; error: string }> };
+    expect(body.errors.map((e) => e.row)).toEqual([3, 4, 5, 5, 6, 7]);
+    expect(body.errors[0].error).toContain('ya existe');
+    expect(body.errors[3].error).toContain('subcategoría 99 no existe');
+    expect(body.errors[4].error).toContain('no pertenece');
+    const list = (await (await call('/api/products/admin/all', {}, true)).json()) as unknown[];
+    expect(list).toHaveLength(3);
+  });
+
+  it('validates a whole file without inserting when dryRun is set', async () => {
+    const many = Array.from({ length: 50 }, (_, i) => row({ row: i + 2, code: `D${i}`, name: `D${i}` }));
+    const ok = await call('/api/products/bulk', json({ dryRun: true, products: many }), true);
+    expect(ok.status).toBe(200);
+    expect(await ok.json()).toEqual({ valid: 50, errors: [] });
+    const bad = await call('/api/products/bulk', json({ dryRun: true, products: [...many, row({ row: 52, code: 'C1', name: 'X' })] }), true);
+    expect(bad.status).toBe(200);
+    expect(await bad.json()).toEqual({ valid: 50, errors: [{ row: 52, error: 'el código "C1" ya existe' }] });
+    const list = (await (await call('/api/products/admin/all', {}, true)).json()) as unknown[];
+    expect(list).toHaveLength(3);
+  });
+
+  it('requires a session and limits the batch size', async () => {
+    expect((await call('/api/products/bulk', json({ products: [row({ code: 'Q', name: 'Q' })] }))).status).toBe(401);
+    expect((await bulk([])).status).toBe(400);
+    const many = Array.from({ length: 101 }, (_, i) => row({ code: `M${i}`, name: `M${i}` }));
+    expect((await bulk(many)).status).toBe(400);
   });
 });
 

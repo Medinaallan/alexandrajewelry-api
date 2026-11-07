@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest';
 import { parseFields, parseId, safeFilename, toMoney } from '../src/utils/validate';
-import { resolveEnglish } from '../src/utils/translate';
 
 const spec = {
   name: { type: 'string', min: 1, max: 10 },
@@ -59,28 +58,5 @@ describe('safeFilename', () => {
     expect(safeFilename('../../etc/pass wd.png')).toBe('etc_pass_wd.png');
     expect(safeFilename('foto.webp')).toBe('foto.webp');
     expect(safeFilename('///')).toBe('file');
-  });
-});
-
-describe('resolveEnglish', () => {
-  const prev = { es: 'Anillo de oro', en: 'Gold ring' };
-
-  it('keeps an English text edited by the admin', async () => {
-    expect(await resolveEnglish({ es: 'Anillo de oro', en: 'Golden ring' }, prev)).toBe('Golden ring');
-  });
-
-  it('leaves the stored translation alone when nothing changed', async () => {
-    expect(await resolveEnglish({ es: 'Anillo de oro', en: 'Gold ring' }, prev)).toBeUndefined();
-    expect(await resolveEnglish({}, prev)).toBeUndefined();
-    // an empty English field in the form must not wipe the stored translation
-    expect(await resolveEnglish({ es: 'Anillo de oro', en: '' }, prev)).toBeUndefined();
-  });
-
-  it('clears the English text when the Spanish text is cleared', async () => {
-    expect(await resolveEnglish({ es: '' }, prev)).toBe('');
-  });
-
-  it('uses the English text given on create', async () => {
-    expect(await resolveEnglish({ es: 'Collar', en: 'Necklace' })).toBe('Necklace');
   });
 });

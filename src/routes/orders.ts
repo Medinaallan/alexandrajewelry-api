@@ -3,13 +3,26 @@ import { desc, eq, inArray } from 'drizzle-orm';
 import { getDb } from '../db';
 import { ordersTable, productsTable } from '../db/schema';
 import { requireAuth } from '../middleware/auth';
+import {
+  registerSales,
+  releaseOrderStock,
+  setOrderStatus,
+  InsufficientStockError,
+  OrderChangedError,
+} from '../db/inventory';
 import { rateLimit } from '../middleware/rateLimit';
 import { parseFields, parseId, toMoney } from '../utils/validate';
 
 type Bindings = { DATABASE_URL: string; JWT_SECRET: string; IMAGES: R2Bucket };
+type Variables = { username: string };
 
 const PAYMENT_METHODS = ['transfer', 'googlepay', 'paypal', 'whatsapp'];
 const ORDER_STATUSES = ['pending', 'confirmed', 'paid', 'shipped', 'delivered', 'cancelled'];
+// In these statuses the order's units are out of stock and counted as sales.
+// Entering one sells the items; leaving to any other status undoes that.
+const STOCK_TAKEN = new Set(['paid', 'shipped', 'delivered']);
+
+type OrderItem = { productId: number; name: string; price: number; quantity: number };
 
 const MAX_ITEMS = 50;
 const MAX_RECEIPT_BYTES = 5 * 1024 * 1024;
@@ -38,7 +51,7 @@ const itemSpec = {
 // the authenticated endpoint below.
 const receiptPrefix = (orderId: number) => `receipts/${orderId}/`;
 
-const orders = new Hono<{ Bindings: Bindings }>();
+const orders = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 
 // Admin: list all orders, newest first
 orders.get('/', requireAuth, async (c) => {
@@ -95,6 +108,7 @@ orders.post('/', rateLimit('PUBLIC_LIMITER'), async (c) => {
       code: productsTable.code,
       name: productsTable.name,
       price: productsTable.price,
+      stock: productsTable.stock,
       active: productsTable.active,
     })
     .from(productsTable)
@@ -105,6 +119,14 @@ orders.post('/', rateLimit('PUBLIC_LIMITER'), async (c) => {
     const product = products.find((p) => p.id === productId);
     if (!product || !product.active) {
       return c.json({ error: 'Uno de los productos de tu carrito ya no está disponible.' }, 409);
+    }
+    // Stock is only checked here; it is taken when the order is marked paid.
+    if (product.stock < quantity) {
+      return c.json({
+        error: product.stock === 0
+          ? `"${product.name}" está agotado. Quítalo del carrito para continuar.`
+          : `Solo quedan ${product.stock} unidades de "${product.name}". Ajusta la cantidad para continuar.`,
+      }, 409);
     }
     items.push({
       productId,
@@ -162,7 +184,8 @@ orders.get('/:id/receipt', requireAuth, async (c) => {
   });
 });
 
-// Admin: update order status
+// Admin: update order status. Moving into paid/shipped/delivered sells the
+// items (stock out, rows in sales); moving back out returns them.
 orders.patch('/:id/status', requireAuth, async (c) => {
   const id = parseId(c.req.param('id'));
   if (!id) return c.json({ error: 'Not found' }, 404);
@@ -171,12 +194,51 @@ orders.patch('/:id/status', requireAuth, async (c) => {
     return c.json({ error: 'Invalid status' }, 400);
   }
   const db = getDb(c.env.DATABASE_URL);
-  const [row] = await db
-    .update(ordersTable)
-    .set({ status })
-    .where(eq(ordersTable.id, id))
-    .returning();
-  if (!row) return c.json({ error: 'Not found' }, 404);
+  const [current] = await db.select().from(ordersTable).where(eq(ordersTable.id, id));
+  if (!current) return c.json({ error: 'Not found' }, 404);
+  if (current.status === status) return c.json(current);
+
+  const transition = { id, from: current.status, to: status };
+  const takes = !STOCK_TAKEN.has(current.status) && STOCK_TAKEN.has(status);
+  const releases = STOCK_TAKEN.has(current.status) && !STOCK_TAKEN.has(status);
+
+  try {
+    if (takes) {
+      const items = (Array.isArray(current.items) ? current.items : []) as OrderItem[];
+      // Friendly message naming the product; registerSales re-checks atomically.
+      const stock = await db
+        .select({ id: productsTable.id, stock: productsTable.stock })
+        .from(productsTable)
+        .where(inArray(productsTable.id, items.map((i) => i.productId)));
+      const short = items.find((i) => (stock.find((p) => p.id === i.productId)?.stock ?? 0) < i.quantity);
+      if (short) {
+        const available = stock.find((p) => p.id === short.productId)?.stock ?? 0;
+        return c.json({
+          error: `No hay stock suficiente de "${short.name}" (pide ${short.quantity}, hay ${available}). Agrega stock antes de marcar el pedido.`,
+        }, 409);
+      }
+      await registerSales(
+        db,
+        items.map((i) => ({ productId: i.productId, quantity: i.quantity, unitPrice: i.price, notes: `Pedido #${id}` })),
+        c.get('username') ?? '',
+        transition,
+      );
+    } else if (releases) {
+      await releaseOrderStock(db, transition);
+    } else {
+      await setOrderStatus(db, transition);
+    }
+  } catch (err) {
+    if (err instanceof InsufficientStockError) {
+      return c.json({ error: 'El stock cambió mientras actualizabas el pedido. Intenta de nuevo.' }, 409);
+    }
+    if (err instanceof OrderChangedError) {
+      return c.json({ error: 'Otra persona cambió este pedido. Recarga la página.' }, 409);
+    }
+    throw err;
+  }
+
+  const [row] = await db.select().from(ordersTable).where(eq(ordersTable.id, id));
   return c.json(row);
 });
 

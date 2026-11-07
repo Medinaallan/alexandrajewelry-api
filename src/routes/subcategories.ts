@@ -3,7 +3,6 @@ import { and, eq } from 'drizzle-orm';
 import { getDb } from '../db';
 import { subcategoriesTable, productsTable } from '../db/schema';
 import { requireAuth } from '../middleware/auth';
-import { resolveEnglish } from '../utils/translate';
 import { parseFields, parseId } from '../utils/validate';
 
 type Bindings = { DATABASE_URL: string; JWT_SECRET: string };
@@ -14,10 +13,8 @@ const subcategories = new Hono<{ Bindings: Bindings }>();
 const subcategorySpec = {
   categoryId: { type: 'number', integer: true, min: 1 },
   name: { type: 'string', min: 1, max: 120 },
-  nameEn: { type: 'string', max: 120 },
   slug: { type: 'string', min: 1, max: 160 },
   description: { type: 'string', max: 2000 },
-  descriptionEn: { type: 'string', max: 2000 },
   active: { type: 'boolean' },
 } as const;
 
@@ -58,13 +55,11 @@ subcategories.post('/', requireAuth, async (c) => {
   const data = parsed.data;
 
   const description = data.description ?? '';
-  const nameEn = (await resolveEnglish({ es: data.name, en: data.nameEn })) ?? '';
-  const descriptionEn = (await resolveEnglish({ es: description, en: data.descriptionEn })) ?? '';
 
   const db = getDb(c.env.DATABASE_URL);
   const [row] = await db
     .insert(subcategoriesTable)
-    .values({ ...data, nameEn, description, descriptionEn })
+    .values({ ...data, description })
     .returning();
   return c.json(row, 201);
 });
@@ -74,24 +69,14 @@ subcategories.put('/:id', requireAuth, async (c) => {
   if (!id) return c.json({ error: 'Not found' }, 404);
   const parsed = parseFields(await c.req.json<unknown>(), subcategorySpec);
   if (!parsed.ok) return c.json({ error: parsed.error }, 400);
-  const { nameEn: nameEnInput, descriptionEn: descriptionEnInput, ...data } = parsed.data;
+  const data = parsed.data;
 
   const db = getDb(c.env.DATABASE_URL);
   const [existing] = await db.select().from(subcategoriesTable).where(eq(subcategoriesTable.id, id));
   if (!existing) return c.json({ error: 'Not found' }, 404);
 
-  const nameEn = await resolveEnglish(
-    { es: data.name, en: nameEnInput },
-    { es: existing.name, en: existing.nameEn },
-  );
-  const descriptionEn = await resolveEnglish(
-    { es: data.description, en: descriptionEnInput },
-    { es: existing.description, en: existing.descriptionEn },
-  );
   const updates = {
     ...data,
-    ...(nameEn !== undefined && { nameEn }),
-    ...(descriptionEn !== undefined && { descriptionEn }),
   };
   if (Object.keys(updates).length === 0) return c.json(existing);
 
