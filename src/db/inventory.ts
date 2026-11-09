@@ -179,6 +179,43 @@ export async function releaseOrderStock(db: SqlExecutor, order: OrderTransition)
   return Number(rows[0].units);
 }
 
+export type VoidResult =
+  | { ok: true; productId: number; quantity: number; newStock: number }
+  | { ok: false; reason: 'not_found' | 'from_order'; orderId?: number };
+
+/**
+ * Cancels a counter sale: deletes it and puts its units back in stock, in one
+ * statement. Sales that came from a web order are not touched here: they are
+ * undone by moving the order out of paid/shipped/delivered.
+ */
+export async function voidSale(db: SqlExecutor, saleId: number): Promise<VoidResult> {
+  const { rows } = await db.execute(sql`
+    WITH s AS (
+      SELECT id, order_id FROM sales WHERE id = ${saleId}::int
+    ),
+    del AS (
+      DELETE FROM sales WHERE id IN (SELECT id FROM s WHERE order_id IS NULL)
+      RETURNING product_id, quantity
+    ),
+    upd AS (
+      UPDATE products p SET stock = p.stock + d.quantity, updated_at = now()
+      FROM del d WHERE p.id = d.product_id
+      RETURNING p.id, p.stock
+    )
+    SELECT
+      (SELECT order_id FROM s) AS order_id,
+      (SELECT product_id FROM del) AS product_id,
+      (SELECT quantity FROM del) AS quantity,
+      (SELECT stock FROM upd) AS new_stock
+  `);
+  const r = rows[0] ?? {};
+  if (r.product_id != null) {
+    return { ok: true, productId: Number(r.product_id), quantity: Number(r.quantity), newStock: Number(r.new_stock) };
+  }
+  if (r.order_id != null) return { ok: false, reason: 'from_order', orderId: Number(r.order_id) };
+  return { ok: false, reason: 'not_found' };
+}
+
 /** Changes an order status when no stock is involved. */
 export async function setOrderStatus(db: SqlExecutor, order: OrderTransition): Promise<void> {
   const { rows } = await db.execute(sql`

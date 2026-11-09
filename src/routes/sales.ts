@@ -3,8 +3,8 @@ import { desc, inArray, sql } from 'drizzle-orm';
 import { getDb } from '../db';
 import { salesTable, productsTable } from '../db/schema';
 import { requireAuth } from '../middleware/auth';
-import { registerSales, InsufficientStockError, type SaleLine } from '../db/inventory';
-import { parseFields } from '../utils/validate';
+import { registerSales, voidSale, InsufficientStockError, type SaleLine } from '../db/inventory';
+import { parseFields, parseId } from '../utils/validate';
 
 type Bindings = { DATABASE_URL: string; JWT_SECRET: string };
 type Variables = { username: string };
@@ -108,6 +108,21 @@ sales.post('/batch', requireAuth, async (c) => {
   const result = await sell(db, lines, c.get('username') ?? '');
   if (!result.ok) return c.json({ error: result.error }, result.status);
   return c.json(result.sales, 201);
+});
+
+// Cancel a counter sale registered by mistake: the units go back to stock
+// and the sale no longer counts in reports.
+sales.delete('/:id', requireAuth, async (c) => {
+  const id = parseId(c.req.param('id'));
+  if (!id) return c.json({ error: 'Not found' }, 404);
+  const result = await voidSale(getDb(c.env.DATABASE_URL), id);
+  if (result.ok) return c.json(result);
+  if (result.reason === 'from_order') {
+    return c.json({
+      error: `Esta venta viene del pedido #${result.orderId}. Para anularla, cambia el estado del pedido a Pendiente o Cancelado.`,
+    }, 409);
+  }
+  return c.json({ error: 'Esta venta ya no existe. Recarga la página.' }, 404);
 });
 
 export { sales };

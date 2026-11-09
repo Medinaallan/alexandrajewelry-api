@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import { and, eq, inArray } from 'drizzle-orm';
 import { getDb } from '../db';
-import { productsTable, productImagesTable, categoriesTable, subcategoriesTable } from '../db/schema';
+import { productsTable, productImagesTable, categoriesTable, subcategoriesTable, salesTable, stockProductsTable } from '../db/schema';
 import { requireAuth } from '../middleware/auth';
 import { parseFields, parseId } from '../utils/validate';
 
@@ -238,6 +238,14 @@ products.delete('/:id', requireAuth, async (c) => {
   const id = parseId(c.req.param('id'));
   if (!id) return c.json({ error: 'Not found' }, 404);
   const db = getDb(c.env.DATABASE_URL);
+  // Sales and stock movements keep a reference to the product
+  const [sold] = await db.select({ id: salesTable.id }).from(salesTable).where(eq(salesTable.productId, id)).limit(1);
+  const [moved] = await db.select({ id: stockProductsTable.id }).from(stockProductsTable).where(eq(stockProductsTable.productId, id)).limit(1);
+  if (sold || moved) {
+    return c.json({
+      error: 'Este producto tiene ventas o movimientos de stock registrados, por eso no se puede borrar. Desactívalo para ocultarlo de la tienda.',
+    }, 409);
+  }
   await db.delete(productsTable).where(eq(productsTable.id, id));
   return c.json({ success: true });
 });

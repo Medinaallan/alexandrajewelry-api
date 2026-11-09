@@ -1,5 +1,5 @@
 import { Hono } from 'hono';
-import { desc, eq, inArray } from 'drizzle-orm';
+import { and, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
 import { getDb } from '../db';
 import { ordersTable, productsTable } from '../db/schema';
 import { requireAuth } from '../middleware/auth';
@@ -61,6 +61,16 @@ orders.get('/', requireAuth, async (c) => {
     .from(ordersTable)
     .orderBy(desc(ordersTable.createdAt));
   return c.json(rows);
+});
+
+// Admin: how many orders are waiting (polled by the panel to announce new ones)
+orders.get('/pending-count', requireAuth, async (c) => {
+  const db = getDb(c.env.DATABASE_URL);
+  const [row] = await db
+    .select({ count: sql<number>`cast(count(*) as int)`, lastId: sql<number | null>`max(${ordersTable.id})` })
+    .from(ordersTable)
+    .where(eq(ordersTable.status, 'pending'));
+  return c.json({ count: row?.count ?? 0, lastId: row?.lastId ?? null });
 });
 
 // Public: create order (called at checkout).
@@ -166,6 +176,72 @@ orders.post('/', rateLimit('PUBLIC_LIMITER'), async (c) => {
   }
 
   return c.json({ id: row.id, total: row.total, receiptUploaded }, 201);
+});
+
+/** "+58 (412) 555-1234" → "584125551234" */
+const phoneDigits = (phone: string) => phone.replace(/\D/g, '');
+
+// Public: a customer checks their order with its number and their phone.
+// A wrong phone answers exactly like a missing order, so order numbers
+// can't be probed; the rate limit slows down guessing.
+orders.get('/track', rateLimit('PUBLIC_LIMITER'), async (c) => {
+  const id = parseId(c.req.query('id') ?? '');
+  const phone = phoneDigits(c.req.query('phone') ?? '');
+  const notFound = () => c.json({ error: 'No encontramos un pedido con ese número y teléfono.' }, 404);
+  if (!id || phone.length < 6) return notFound();
+  const db = getDb(c.env.DATABASE_URL);
+  const [row] = await db.select().from(ordersTable).where(eq(ordersTable.id, id));
+  if (!row || phoneDigits(row.customerPhone) !== phone) return notFound();
+  const items = (Array.isArray(row.items) ? row.items : []) as Array<OrderItem & { subtotal: number }>;
+  return c.json({
+    id: row.id,
+    status: row.status,
+    paymentMethod: row.paymentMethod,
+    total: row.total,
+    createdAt: row.createdAt,
+    paymentReported: row.paymentRef != null,
+    items: items.map((i) => ({ name: i.name, quantity: i.quantity, subtotal: i.subtotal })),
+  });
+});
+
+// PayPal ids are uppercase letters and digits (capture ids are 17 long).
+const PAYPAL_ID = /^[A-Z0-9]{10,40}$/;
+// Before payment the order is waiting; afterwards the admin moves it on.
+const PAYABLE = ['pending', 'confirmed'];
+
+// Public: the customer's browser reports a PayPal payment for the order.
+// The API has no PayPal secret, so this is NOT a proof of payment: it only
+// stores the capture id and amount for the admin, who checks them in PayPal
+// before marking the order paid. The phone works as in /track, and only the
+// first report is kept.
+orders.post('/:id/paypal', rateLimit('PUBLIC_LIMITER'), async (c) => {
+  const id = parseId(c.req.param('id'));
+  const body = await c.req.json<unknown>().catch(() => null);
+  const parsed = parseFields(body, {
+    phone: { type: 'string', min: 1, max: 40 },
+    captureId: { type: 'string', min: 1, max: 40 },
+    amount: { type: 'number', min: 0 },
+  } as const, ['phone', 'captureId', 'amount']);
+  if (!parsed.ok) return c.json({ error: parsed.error }, 400);
+  const { phone, captureId, amount } = parsed.data;
+  if (!PAYPAL_ID.test(captureId)) return c.json({ error: 'Invalid capture id' }, 400);
+
+  const notFound = () => c.json({ error: 'No encontramos un pedido con ese número y teléfono.' }, 404);
+  if (!id) return notFound();
+  const db = getDb(c.env.DATABASE_URL);
+  const [row] = await db.select().from(ordersTable).where(eq(ordersTable.id, id));
+  if (!row || phoneDigits(row.customerPhone) !== phoneDigits(phone)) return notFound();
+  if (row.paymentMethod !== 'paypal' || !PAYABLE.includes(row.status)) {
+    return c.json({ error: 'Este pedido no espera un pago con PayPal.' }, 409);
+  }
+
+  const updated = await db
+    .update(ordersTable)
+    .set({ paymentRef: captureId, paymentAmount: toMoney(amount) })
+    .where(and(eq(ordersTable.id, id), isNull(ordersTable.paymentRef)))
+    .returning({ id: ordersTable.id });
+  if (updated.length === 0) return c.json({ error: 'Este pedido ya tiene un pago registrado.' }, 409);
+  return c.json({ ok: true });
 });
 
 // Admin: download the transfer receipt attached to an order

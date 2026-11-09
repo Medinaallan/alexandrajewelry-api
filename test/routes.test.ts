@@ -370,6 +370,69 @@ describe('sales and stock', () => {
   });
 });
 
+describe('voiding a counter sale', () => {
+  const stockOf = async (id: number) =>
+    (await client.query<{ stock: number }>('SELECT stock FROM products WHERE id = $1', [id])).rows[0].stock;
+
+  it('returns the units and removes the sale from reports', async () => {
+    await call('/api/sales', json({ productId: 1, quantity: 2 }), true);
+    expect(await stockOf(1)).toBe(3);
+    expect((await call('/api/sales/1', { method: 'DELETE' })).status).toBe(401);
+    const res = await call('/api/sales/1', { method: 'DELETE' }, true);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ ok: true, productId: 1, quantity: 2, newStock: 5 });
+    expect(await stockOf(1)).toBe(5);
+    expect(await (await call('/api/sales/report', {}, true)).json()).toEqual([]);
+    expect((await call('/api/sales/1', { method: 'DELETE' }, true)).status).toBe(404);
+  });
+
+  it('refuses sales that belong to a web order', async () => {
+    await call('/api/orders', json({ ...customer, items: [{ productId: 1, quantity: 1 }] }));
+    await call('/api/orders/1/status', { method: 'PATCH', body: JSON.stringify({ status: 'paid' }) }, true);
+    const res = await call('/api/sales/1', { method: 'DELETE' }, true);
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { error: string }).error).toContain('pedido #1');
+    expect(await stockOf(1)).toBe(4);
+  });
+});
+
+describe('pending order count', () => {
+  it('counts pending orders and reports the newest one', async () => {
+    expect((await call('/api/orders/pending-count')).status).toBe(401);
+    const empty = await call('/api/orders/pending-count', {}, true);
+    expect(await empty.json()).toEqual({ count: 0, lastId: null });
+    await call('/api/orders', json({ ...customer, items: [{ productId: 1, quantity: 1 }] }));
+    await call('/api/orders', json({ ...customer, items: [{ productId: 2, quantity: 1 }] }));
+    await call('/api/orders/1/status', { method: 'PATCH', body: JSON.stringify({ status: 'confirmed' }) }, true);
+    expect(await (await call('/api/orders/pending-count', {}, true)).json()).toEqual({ count: 1, lastId: 2 });
+  });
+});
+
+describe('order tracking', () => {
+  it('shows the order only with the matching phone', async () => {
+    await call('/api/orders', json({ ...customer, phone: '+58 (412) 555-1234', items: [{ productId: 2, quantity: 1 }] }));
+    const ok = await call('/api/orders/track?id=1&phone=584125551234');
+    expect(ok.status).toBe(200);
+    const body = (await ok.json()) as Record<string, unknown>;
+    expect(body).toMatchObject({ id: 1, status: 'pending', total: 80, items: [{ name: 'Collar', quantity: 1, subtotal: 80 }] });
+    expect(body).not.toHaveProperty('customerAddress');
+    expect(body).not.toHaveProperty('customerName');
+    expect((await call('/api/orders/track?id=1&phone=584125559999')).status).toBe(404);
+    expect((await call('/api/orders/track?id=2&phone=584125551234')).status).toBe(404);
+    expect((await call('/api/orders/track?id=1&phone=')).status).toBe(404);
+  });
+});
+
+describe('deleting products', () => {
+  it('explains that a product with sales must be deactivated instead', async () => {
+    await call('/api/sales', json({ productId: 1, quantity: 1 }), true);
+    const res = await call('/api/products/1', { method: 'DELETE' }, true);
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { error: string }).error).toContain('Desactívalo');
+    expect((await call('/api/products/2', { method: 'DELETE' }, true)).status).toBe(200);
+  });
+});
+
 describe('users', () => {
   it('does not let the last admin delete or deactivate themselves', async () => {
     expect((await call('/api/users/1', { method: 'DELETE' }, true)).status).toBe(409);
@@ -386,5 +449,31 @@ describe('users', () => {
       .sign(new TextEncoder().encode(JWT_SECRET));
     const res = await app.request('/api/users', { headers: { Authorization: `Bearer ${staff}` } }, env());
     expect(res.status).toBe(403);
+  });
+});
+
+describe('PayPal payment report', () => {
+  const report = (id: number, body: Record<string, unknown>) =>
+    call(`/api/orders/${id}/paypal`, json({ phone: '4125551234', captureId: '3C679366HH908993F', amount: 120.5, ...body }));
+
+  it('stores the first report for a waiting PayPal order and shows it to the admin', async () => {
+    await call('/api/orders', json({ ...customer, phone: '412-555-1234', paymentMethod: 'paypal', items: [{ productId: 1, quantity: 1 }] }));
+    expect((await report(1, {})).status).toBe(200);
+    expect((await report(1, { captureId: '9AB12345678901234' })).status).toBe(409);
+    const [order] = (await (await call('/api/orders', {}, true)).json()) as Array<Record<string, unknown>>;
+    expect(order).toMatchObject({ paymentRef: '3C679366HH908993F', paymentAmount: 120.5, status: 'pending' });
+    const tracked = await (await call('/api/orders/track?id=1&phone=4125551234')).json();
+    expect(tracked).toMatchObject({ paymentReported: true });
+  });
+
+  it('rejects a wrong phone, a bad id, and orders that do not wait for PayPal', async () => {
+    await call('/api/orders', json({ ...customer, phone: '412-555-1234', paymentMethod: 'paypal', items: [{ productId: 1, quantity: 1 }] }));
+    await call('/api/orders', json({ ...customer, phone: '412-555-1234', items: [{ productId: 1, quantity: 1 }] }));
+    expect((await report(1, { phone: '999' })).status).toBe(404);
+    expect((await report(9, {})).status).toBe(404);
+    expect((await report(1, { captureId: 'abc; drop' })).status).toBe(400);
+    expect((await report(2, {})).status).toBe(409);
+    await call('/api/orders/1/status', { method: 'PATCH', body: JSON.stringify({ status: 'cancelled' }) }, true);
+    expect((await report(1, {})).status).toBe(409);
   });
 });

@@ -147,5 +147,9 @@ export const ordersTable = pgTable('orders', {
   items: jsonb('items').notNull(),
   total: money('total').notNull(),
   status: text('status').notNull().default('pending'),
+  // PayPal payment the customer's browser reported (capture id and amount).
+  // Not verified with PayPal: the admin checks it before marking the order paid.
+  paymentRef: text('payment_ref'),
+  paymentAmount: money('payment_amount'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
