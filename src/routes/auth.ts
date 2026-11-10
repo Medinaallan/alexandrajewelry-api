@@ -5,7 +5,7 @@ import { getDb } from '../db';
 import { passwordResetsTable, usersTable } from '../db/schema';
 import { hashPassword, verifyPassword } from '../utils/password';
 import { rateLimit } from '../middleware/rateLimit';
-import { executionCtx, inBackground, passwordResetMail, sendMail, type MailEnv } from '../mail';
+import { executionCtx, inBackground, passwordResetMail, sendMail, withStore, type MailEnv } from '../mail';
 
 type Bindings = { DATABASE_URL: string; JWT_SECRET: string } & MailEnv;
 
@@ -66,7 +66,8 @@ auth.post('/forgot', rateLimit('LOGIN_LIMITER'), async (c) => {
     // Computed by the database, in its own clock
     expiresAt: sql`now() + make_interval(secs => ${RESET_TTL_MS / 1000})`,
   });
-  await inBackground(executionCtx(c), sendMail(c.env, passwordResetMail(c.env, user.email, user.username, token)));
+  const menv = await withStore(c.env);
+  await inBackground(executionCtx(c), sendMail(menv, passwordResetMail(menv, user.email, user.username, token)));
   return c.json(answer);
 });
 

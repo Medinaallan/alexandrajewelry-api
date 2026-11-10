@@ -5,7 +5,7 @@ import { contactMessagesTable } from '../db/schema';
 import { requireAuth } from '../middleware/auth';
 import { rateLimit } from '../middleware/rateLimit';
 import { parseFields, parseId } from '../utils/validate';
-import { contactStoreMail, executionCtx, inBackground, isEmail, sendMail, type MailEnv } from '../mail';
+import { contactStoreMail, executionCtx, inBackground, isEmail, sendMail, withStore, type MailEnv } from '../mail';
 
 type Bindings = { DATABASE_URL: string; JWT_SECRET: string } & MailEnv;
 
@@ -27,7 +27,8 @@ contact.post('/', rateLimit('PUBLIC_LIMITER'), async (c) => {
 
   const db = getDb(c.env.DATABASE_URL);
   const [row] = await db.insert(contactMessagesTable).values(m).returning({ id: contactMessagesTable.id });
-  await inBackground(executionCtx(c), sendMail(c.env, contactStoreMail(c.env, m)));
+  const menv = await withStore(c.env);
+  await inBackground(executionCtx(c), sendMail(menv, contactStoreMail(menv, m)));
   return c.json({ id: row.id }, 201);
 });
 

@@ -11,6 +11,7 @@ import { eq } from 'drizzle-orm';
 import { getDb } from './db';
 import { settingsTable } from './db/schema';
 import { open } from './utils/secretBox';
+import { DEFAULT_STORE, getBankAccounts, getStoreSettings, type BankAccount, type StoreSettings } from './storeSettings';
 
 export type MailEnv = {
   DATABASE_URL?: string;
@@ -24,7 +25,17 @@ export type MailEnv = {
   STORE_EMAIL?: string;
   /** Public site, for links inside the emails */
   SITE_URL?: string;
+  /** Filled by withStore(): the store details and bank accounts from the panel */
+  STORE?: StoreSettings;
+  BANK_ACCOUNTS?: BankAccount[];
 };
+
+/** The env plus the store details and bank accounts, for building emails. */
+export async function withStore<E extends MailEnv>(env: E): Promise<E> {
+  if (env.STORE) return env;
+  const [store, accounts] = await Promise.all([getStoreSettings(env.DATABASE_URL), getBankAccounts(env.DATABASE_URL)]);
+  return { ...env, STORE: store, BANK_ACCOUNTS: accounts };
+}
 
 export type Mail = {
   to: string;
@@ -45,7 +56,7 @@ const STORE_NAME = 'Alexandra Jewelry';
 const DEFAULT_STORE_EMAIL = 'alexandrajewelry2@gmail.com';
 const DEFAULT_SITE_URL = 'https://alexandrajewelry.vercel.app';
 
-export const storeEmail = (env: MailEnv) => env.STORE_EMAIL || DEFAULT_STORE_EMAIL;
+export const storeEmail = (env: MailEnv) => env.STORE?.notifyEmail || env.STORE_EMAIL || DEFAULT_STORE_EMAIL;
 export const siteUrl = (env: MailEnv) => (env.SITE_URL || DEFAULT_SITE_URL).replace(/\/$/, '');
 
 const EMAIL_RE = /^[^\s@<>"]+@[^\s@<>"]+\.[^\s@<>"]+$/;
@@ -179,7 +190,9 @@ const itemsText = (items: Line[], total: number) =>
   [...items.map((i) => `- ${i.quantity} x ${i.name}: ${money(i.subtotal)}`), `Total: ${money(total)}`].join('\n');
 
 /** Wraps the body in the store's simple layout. `body` must already be escaped. */
-function layout(title: string, body: string): string {
+function layout(title: string, body: string, env: MailEnv): string {
+  const st = env.STORE ?? DEFAULT_STORE;
+  const footer = [st.name, [st.street, st.cityLine].filter(Boolean).join(', '), st.phone].filter(Boolean).map(escapeHtml).join(' · ');
   return `<!doctype html><html lang="es"><body style="margin:0;background:#f6f4ef;font-family:Georgia,'Times New Roman',serif;color:#1a1a1a">
 <div style="max-width:560px;margin:0 auto;padding:32px 20px">
 <div style="text-align:center;letter-spacing:4px;font-size:20px;margin-bottom:4px">ALEXANDRA</div>
@@ -189,7 +202,7 @@ function layout(title: string, body: string): string {
 ${body}
 </div>
 <p style="text-align:center;font-family:Arial,sans-serif;font-size:12px;color:#888;margin-top:20px">
-Alexandra Jewelry · 16 Ashland Street, North Adams, MA 01247 · 413-770-9901</p>
+${footer}</p>
 </div></body></html>`;
 }
 
@@ -220,12 +233,34 @@ const PAYMENT_LABEL: Record<string, string> = {
 const trackUrl = (env: MailEnv, id: number) => `${siteUrl(env)}/track?id=${id}`;
 const firstName = (name: string) => name.trim().split(/\s+/)[0] ?? '';
 
+function bankHtml(accounts: BankAccount[]): string {
+  return accounts
+    .map(
+      (a) =>
+        `<div style="border:1px solid #e8e2d6;padding:10px 12px;margin:8px 0;font-size:14px">` +
+        `<strong>${escapeHtml(a.bank)}</strong><br>Titular: ${escapeHtml(a.holder)}<br>Cuenta: <strong>${escapeHtml(a.number)}</strong>` +
+        (a.details ? `<br>${escapeHtml(a.details)}` : '') +
+        `</div>`,
+    )
+    .join('');
+}
+
+const bankText = (accounts: BankAccount[]) =>
+  accounts.map((a) => `- ${a.bank} | Titular: ${a.holder} | Cuenta: ${a.number}${a.details ? ` | ${a.details}` : ''}`).join('\n');
+
 /** To the customer, right after placing the order. */
-export function orderReceivedMail(env: MailEnv, o: OrderForMail): Mail {
+export function orderReceivedMail(env: MailEnv, o: OrderForMail, receiptAttached = false): Mail {
+  const accounts = env.BANK_ACCOUNTS ?? [];
+  const isTransfer = o.paymentMethod === 'transfer';
   const pay =
     o.paymentMethod === 'paypal'
       ? 'Si aún no pagaste, puedes hacerlo desde el seguimiento de tu pedido durante las próximas 24 horas.'
-      : 'Te contactaremos pronto para confirmar tu pedido y el pago.';
+      : isTransfer && receiptAttached
+        ? 'Recibimos tu comprobante de pago. Lo verificaremos y te avisaremos.'
+        : isTransfer
+          ? 'Haz la transferencia a una de estas cuentas y luego sube el comprobante desde el seguimiento de tu pedido.'
+          : 'Te contactaremos pronto para confirmar tu pedido y el pago.';
+  const banks = isTransfer && !receiptAttached && accounts.length ? bankHtml(accounts) : '';
   return {
     to: o.customerEmail,
     replyTo: storeEmail(env),
@@ -233,16 +268,17 @@ export function orderReceivedMail(env: MailEnv, o: OrderForMail): Mail {
     html: layout(
       `¡Gracias, ${escapeHtml(firstName(o.customerName))}!`,
       `<p>Recibimos tu pedido <strong>#${o.id}</strong>.</p>${itemsTable(o.items, o.total)}` +
-        `<p>Forma de pago: ${escapeHtml(PAYMENT_LABEL[o.paymentMethod] ?? o.paymentMethod)}</p><p>${escapeHtml(pay)}</p>` +
+        `<p>Forma de pago: ${escapeHtml(PAYMENT_LABEL[o.paymentMethod] ?? o.paymentMethod)}</p><p>${escapeHtml(pay)}</p>${banks}` +
         button(trackUrl(env, o.id), 'Ver mi pedido') +
         `<p style="font-size:13px;color:#666">Para ver tu pedido necesitas tu número de pedido y el teléfono que usaste.</p>`,
+      env,
     ),
-    text: `Gracias, ${firstName(o.customerName)}. Recibimos tu pedido #${o.id}.\n\n${itemsText(o.items, o.total)}\n\n${pay}\n\nSigue tu pedido: ${trackUrl(env, o.id)}`,
+    text: `Gracias, ${firstName(o.customerName)}. Recibimos tu pedido #${o.id}.\n\n${itemsText(o.items, o.total)}\n\n${pay}${banks ? `\n${bankText(accounts)}` : ''}\n\nSigue tu pedido: ${trackUrl(env, o.id)}`,
   };
 }
 
 /** To the store, when a new order arrives. */
-export function newOrderStoreMail(env: MailEnv, o: OrderForMail): Mail {
+export function newOrderStoreMail(env: MailEnv, o: OrderForMail, receiptAttached = false): Mail {
   const details = [
     ['Cliente', o.customerName],
     ['Teléfono', o.customerPhone],
@@ -254,12 +290,14 @@ export function newOrderStoreMail(env: MailEnv, o: OrderForMail): Mail {
   return {
     to: storeEmail(env),
     replyTo: o.customerEmail || undefined,
-    subject: `Nuevo pedido #${o.id} - ${o.customerName} - ${money(o.total)}`,
+    subject: `Nuevo pedido #${o.id} - ${o.customerName} - ${money(o.total)}${receiptAttached ? ' - CON COMPROBANTE' : ''}`,
     html: layout(
       `Nuevo pedido #${o.id}`,
       details.map(([k, v]) => `<div><strong>${k}:</strong> ${escapeHtml(v)}</div>`).join('') +
+        (receiptAttached ? '<p style="color:#b45309"><strong>El cliente adjuntó el comprobante de transferencia.</strong> Revísalo en el panel y confirma el pago.</p>' : '') +
         itemsTable(o.items, o.total) +
         button(`${siteUrl(env)}/admin/orders`, 'Abrir pedidos'),
+      env,
     ),
     text: `Nuevo pedido #${o.id}\n${details.map(([k, v]) => `${k}: ${v}`).join('\n')}\n\n${itemsText(o.items, o.total)}`,
   };
@@ -274,7 +312,7 @@ const STATUS_MAIL: Record<string, { subject: string; title: string; body: string
   review: {
     subject: 'Recibimos tu pago',
     title: 'Recibimos tu pago',
-    body: 'Recibimos tu pago con PayPal. Lo estamos verificando y te avisaremos cuando preparemos tu pedido.',
+    body: 'Recibimos tu pago. Lo estamos verificando y te avisaremos cuando preparemos tu pedido.',
   },
   paid: {
     subject: 'Pago confirmado',
@@ -312,6 +350,7 @@ export function statusMail(env: MailEnv, o: OrderForMail, status: string, extra 
       `<p>Hola ${escapeHtml(firstName(o.customerName))},</p><p>${escapeHtml(body)}</p>` +
         `<p>Pedido <strong>#${o.id}</strong></p>${itemsTable(o.items, o.total)}` +
         button(trackUrl(env, o.id), 'Ver mi pedido'),
+      env,
     ),
     text: `Hola ${firstName(o.customerName)},\n\n${body}\n\nPedido #${o.id}\n${itemsText(o.items, o.total)}\n\nSigue tu pedido: ${trackUrl(env, o.id)}`,
   };
@@ -331,6 +370,7 @@ export function paypalStoreMail(env: MailEnv, o: OrderForMail, captureId: string
       `<p>Referencia: <strong>${escapeHtml(captureId)}</strong><br>Monto reportado: <strong>${money(amount)}</strong>${escapeHtml(mismatch)}</p>` +
         `<p style="color:${stockShort ? '#c0392b' : '#333'}">${escapeHtml(warn)}</p>` +
         button(`https://www.paypal.com/activity/payment/${encodeURIComponent(captureId)}`, 'Ver en PayPal'),
+      env,
     ),
     text: `Pago PayPal del pedido #${o.id}\nReferencia: ${captureId}\nMonto: ${money(amount)}${mismatch}\n${warn}`,
   };
@@ -348,6 +388,7 @@ export function contactStoreMail(env: MailEnv, m: { name: string; email: string;
         (m.phone ? `<div><strong>Teléfono:</strong> ${escapeHtml(m.phone)}</div>` : '') +
         `<p style="white-space:pre-wrap;border-left:3px solid #b08d57;padding-left:12px">${escapeHtml(m.message)}</p>` +
         `<p style="font-size:13px;color:#666">Responde a este correo para contestarle directamente.</p>`,
+      env,
     ),
     text: `Nombre: ${m.name}\nCorreo: ${m.email}\nTeléfono: ${m.phone}\n\n${m.message}`,
   };
@@ -359,7 +400,9 @@ export function testMail(env: MailEnv, to: string): Mail {
     to,
     replyTo: storeEmail(env),
     subject: 'Correo de prueba - Alexandra Jewelry',
-    html: layout('¡Funciona!', '<p>Este es un correo de prueba. Los avisos de pedidos y mensajes de la tienda se enviarán con esta cuenta.</p>'),
+    html: layout('¡Funciona!', '<p>Este es un correo de prueba. Los avisos de pedidos y mensajes de la tienda se enviarán con esta cuenta.</p>',
+      env,
+    ),
     text: 'Este es un correo de prueba. Los avisos de la tienda se enviarán con esta cuenta.',
   };
 }
@@ -375,7 +418,29 @@ export function passwordResetMail(env: MailEnv, to: string, username: string, to
       `<p>Hola ${escapeHtml(username)},</p><p>Pediste crear una contraseña nueva para el panel de la tienda. El enlace sirve una sola vez y vence en 1 hora.</p>` +
         button(link, 'Crear contraseña nueva') +
         `<p style="font-size:13px;color:#666">Si no lo pediste, ignora este correo: tu contraseña no cambia.</p>`,
+      env,
     ),
     text: `Hola ${username},\n\nPara crear una contraseña nueva abre este enlace (sirve una vez y vence en 1 hora):\n${link}\n\nSi no lo pediste, ignora este correo.`,
+  };
+}
+
+/** To the store when a customer attaches the transfer receipt after ordering. */
+export function receiptStoreMail(env: MailEnv, o: OrderForMail, stockShort: boolean): Mail {
+  const note = stockShort
+    ? 'ATENCIÓN: ya no hay stock suficiente para este pedido. Repón el stock o devuelve el dinero.'
+    : 'El stock ya quedó apartado. Revisa el comprobante en el panel y confirma el pago.';
+  return {
+    to: storeEmail(env),
+    replyTo: o.customerEmail || undefined,
+    subject: `Comprobante de pago - Pedido #${o.id} - ${money(o.total)}${stockShort ? ' - SIN STOCK' : ''}`,
+    html: layout(
+      `Llegó un comprobante del pedido #${o.id}`,
+      `<p>${escapeHtml(o.customerName)} (${escapeHtml(o.customerPhone)}) adjuntó el comprobante de su transferencia.</p>` +
+        `<p style="color:${stockShort ? '#c0392b' : '#333'}">${escapeHtml(note)}</p>` +
+        itemsTable(o.items, o.total) +
+        button(`${siteUrl(env)}/admin/orders`, 'Abrir pedidos'),
+      env,
+    ),
+    text: `${o.customerName} adjuntó el comprobante del pedido #${o.id}.\n${note}\n\n${itemsText(o.items, o.total)}`,
   };
 }

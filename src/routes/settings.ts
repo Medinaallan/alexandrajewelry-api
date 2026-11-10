@@ -6,12 +6,22 @@ import { requireAuth, requireAdmin } from '../middleware/auth';
 import { parseFields } from '../utils/validate';
 import { seal, open } from '../utils/secretBox';
 import {
+  BANK_SETTINGS_KEY,
+  STORE_SETTINGS_KEY,
+  clearSettingsCache,
+  getBankAccounts,
+  getStoreSettings,
+  type BankAccount,
+  type StoreSettings,
+} from '../storeSettings';
+import {
   clearSmtpCache,
   deliver,
   isEmail,
   loadSmtpConfig,
   storeEmail,
   testMail,
+  withStore,
   SMTP_SETTINGS_KEY,
   type MailEnv,
   type StoredSmtp,
@@ -41,12 +51,101 @@ settings.get('/public/payments', async (c) => {
   return c.json({ paypal: paypal ? { configured: true, enabled: paypal.enabled, clientId: paypal.clientId } : { configured: false } });
 });
 
+// Everything the public site needs: store details, bank accounts, PayPal.
+settings.get('/public', async (c) => {
+  const [store, bankAccounts, paypal] = await Promise.all([
+    getStoreSettings(c.env.DATABASE_URL),
+    getBankAccounts(c.env.DATABASE_URL),
+    readPaypalSettings(c.env.DATABASE_URL),
+  ]);
+  const { notifyEmail: _private, ...publicStore } = store;
+  c.header('Cache-Control', 'public, max-age=60');
+  return c.json({
+    store: publicStore,
+    bankAccounts,
+    paypal: paypal ? { configured: true, enabled: paypal.enabled, clientId: paypal.clientId } : { configured: false },
+  });
+});
+
 // ─── Admin ───────────────────────────────────────────────────────────────────
 
 // Everything else is for administrators only
 settings.use('/mail', requireAuth, requireAdmin);
 settings.use('/mail/*', requireAuth, requireAdmin);
 settings.use('/paypal', requireAuth, requireAdmin);
+settings.use('/store', requireAuth, requireAdmin);
+settings.use('/bank', requireAuth, requireAdmin);
+
+async function saveSetting(c: { env: Bindings; get(key: 'username'): string }, key: string, value: unknown) {
+  const updatedBy = c.get('username') ?? '';
+  await getDb(c.env.DATABASE_URL)
+    .insert(settingsTable)
+    .values({ key, value, updatedBy })
+    .onConflictDoUpdate({ target: settingsTable.key, set: { value, updatedBy, updatedAt: new Date() } });
+  clearSettingsCache();
+}
+
+// Mi tienda: name, address, phone, WhatsApp, emails, hours, top bar
+settings.get('/store', async (c) => c.json(await getStoreSettings(c.env.DATABASE_URL)));
+
+settings.put('/store', async (c) => {
+  const parsed = parseFields(await c.req.json<unknown>(), {
+    name: { type: 'string', min: 1, max: 80 },
+    street: { type: 'string', max: 120 },
+    cityLine: { type: 'string', max: 120 },
+    phone: { type: 'string', max: 40 },
+    whatsapp: { type: 'string', max: 40 },
+    email: { type: 'string', max: 200 },
+    notifyEmail: { type: 'string', max: 200 },
+    hours: { type: 'string', max: 600 },
+    topbarMessage: { type: 'string', max: 160 },
+  } as const, ['name']);
+  if (!parsed.ok) return c.json({ error: parsed.error }, 400);
+  const d = parsed.data;
+  const value: StoreSettings = {
+    name: d.name.trim(),
+    street: (d.street ?? '').trim(),
+    cityLine: (d.cityLine ?? '').trim(),
+    phone: (d.phone ?? '').trim(),
+    // WhatsApp links need the digits only; a 10-digit US number gets its +1
+    whatsapp: ((w) => (w.length === 10 ? `1${w}` : w))((d.whatsapp ?? '').replace(/\D/g, '')),
+    email: (d.email ?? '').trim(),
+    notifyEmail: (d.notifyEmail ?? '').trim(),
+    hours: (d.hours ?? '').trim(),
+    topbarMessage: (d.topbarMessage ?? '').trim(),
+  };
+  if (value.email && !isEmail(value.email)) return c.json({ error: 'El correo de contacto no es válido.' }, 400);
+  if (value.notifyEmail && !isEmail(value.notifyEmail)) return c.json({ error: 'El correo para avisos no es válido.' }, 400);
+  if (value.whatsapp && value.whatsapp.length < 8) return c.json({ error: 'El número de WhatsApp está incompleto (incluye el código de país).' }, 400);
+  await saveSetting(c, STORE_SETTINGS_KEY, value);
+  return c.json(value);
+});
+
+// Cuentas bancarias: shown to customers who pay by transfer
+settings.get('/bank', async (c) => c.json({ accounts: await getBankAccounts(c.env.DATABASE_URL) }));
+
+settings.put('/bank', async (c) => {
+  const { accounts } = await c.req.json<{ accounts?: unknown }>();
+  if (!Array.isArray(accounts) || accounts.length > 10) return c.json({ error: 'Invalid request' }, 400);
+  const clean: BankAccount[] = [];
+  for (const [i, raw] of accounts.entries()) {
+    const parsed = parseFields(raw, {
+      bank: { type: 'string', min: 1, max: 80 },
+      holder: { type: 'string', min: 1, max: 120 },
+      number: { type: 'string', min: 1, max: 80 },
+      details: { type: 'string', max: 300 },
+    } as const, ['bank', 'holder', 'number']);
+    if (!parsed.ok) return c.json({ error: `Cuenta ${i + 1}: completa el banco, el titular y el número de cuenta.` }, 400);
+    clean.push({
+      bank: parsed.data.bank.trim(),
+      holder: parsed.data.holder.trim(),
+      number: parsed.data.number.trim(),
+      details: (parsed.data.details ?? '').trim(),
+    });
+  }
+  await saveSetting(c, BANK_SETTINGS_KEY, { accounts: clean });
+  return c.json({ accounts: clean });
+});
 
 settings.get('/paypal', async (c) => {
   const paypal = await readPaypalSettings(c.env.DATABASE_URL);
@@ -88,7 +187,7 @@ settings.get('/mail', async (c) => {
     // Saved, but the key changed: it has to be entered again
     passwordUnreadable: Boolean(stored?.passSealed) && !passwordReadable,
     source,
-    notifyEmail: storeEmail(c.env),
+    notifyEmail: storeEmail(await withStore(c.env)),
     updatedAt,
     updatedBy,
   });
@@ -144,7 +243,7 @@ settings.post('/mail/test', async (c) => {
   const config = await loadSmtpConfig(c.env);
   if (!config) return c.json({ error: 'Primero guarda la cuenta de correo.' }, 400);
   try {
-    await deliver(config, testMail(c.env, target));
+    await deliver(config, testMail(await withStore(c.env), target));
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
     const hint = /auth|535|534|credential|username|password/i.test(detail)

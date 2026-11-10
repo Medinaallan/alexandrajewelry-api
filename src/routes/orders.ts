@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
-import { and, desc, eq, inArray, isNull, lt, sql } from 'drizzle-orm';
+import { and, desc, eq, gte, inArray, isNull, lt, or, sql } from 'drizzle-orm';
 import { getDb, type Db } from '../db';
-import { ordersTable, productsTable } from '../db/schema';
+import { contactMessagesTable, ordersTable, productsTable, salesTable, testimonialsTable } from '../db/schema';
 import { requireAuth } from '../middleware/auth';
 import {
   registerSales,
@@ -20,8 +20,10 @@ import {
   newOrderStoreMail,
   orderReceivedMail,
   paypalStoreMail,
+  receiptStoreMail,
   sendMail,
   statusMail,
+  withStore,
   type MailEnv,
   type OrderForMail,
 } from '../mail';
@@ -110,6 +112,8 @@ export async function expireUnpaidPaypalOrders(db: Db, env: MailEnv): Promise<nu
     .where(
       and(
         eq(ordersTable.paymentMethod, 'paypal'),
+        // Orders typed in the panel are followed up by the operator, never expired
+        eq(ordersTable.source, 'web'),
         inArray(ordersTable.status, ['pending', 'confirmed']),
         isNull(ordersTable.paymentRef),
         // Compared in the database's own clock (created_at is set by it)
@@ -117,10 +121,11 @@ export async function expireUnpaidPaypalOrders(db: Db, env: MailEnv): Promise<nu
       ),
     )
     .returning();
+  const menv = await withStore(env);
   await Promise.all(
     expired.map((row) => {
-      const mail = statusMail(env, toMailOrder(row), 'cancelled', 'No recibimos el pago dentro de las 24 horas.');
-      return mail ? sendMail(env, mail) : false;
+      const mail = statusMail(menv, toMailOrder(row), 'cancelled', 'No recibimos el pago dentro de las 24 horas.');
+      return mail ? sendMail(menv, mail) : false;
     }),
   );
   return expired.length;
@@ -210,6 +215,44 @@ function parseAdminCustomer(payload: unknown) {
   };
 }
 
+/** The store's time zone: "today" on the summary page means its day. */
+const STORE_TIMEZONE = 'America/New_York';
+
+/** Waiting for the operator to collect the payment (not a PayPal order waiting for the customer). */
+// (Orders typed in the panel are always collected by the operator, PayPal included.)
+const NEEDS_PAYMENT = sql`${ordersTable.status} in ('pending', 'confirmed') and not (${ordersTable.paymentMethod} = 'paypal' and ${ordersTable.paymentRef} is null and ${ordersTable.source} = 'web')`;
+
+/**
+ * Saves a transfer receipt for the order and, if the order is still waiting,
+ * sets its stock aside by moving it to "review" (payment to check). If the
+ * stock ran out, the receipt is kept and the order stays as it was.
+ */
+async function attachReceipt(env: Bindings, db: Db, row: OrderRow, file: File): Promise<{ saved: boolean; stockShort: boolean }> {
+  try {
+    const key = `${receiptPrefix(row.id)}${Date.now()}-${crypto.randomUUID()}.${RECEIPT_TYPES[file.type]}`;
+    await env.IMAGES.put(key, await file.arrayBuffer(), { httpMetadata: { contentType: file.type } });
+  } catch (err) {
+    console.error('Receipt upload failed for order', row.id, err);
+    return { saved: false, stockShort: false };
+  }
+  await db.update(ordersTable).set({ receiptAt: sql`now()` }).where(eq(ordersTable.id, row.id));
+  if (!['pending', 'confirmed'].includes(row.status)) return { saved: true, stockShort: false };
+  try {
+    const items = (Array.isArray(row.items) ? row.items : []) as OrderItem[];
+    await registerSales(
+      db,
+      items.map((i) => ({ productId: i.productId, quantity: i.quantity, unitPrice: i.price, notes: `Pedido #${row.id} (transferencia)` })),
+      'Transferencia',
+      { id: row.id, from: row.status, to: 'review' },
+    );
+    return { saved: true, stockShort: false };
+  } catch (err) {
+    if (err instanceof InsufficientStockError) return { saved: true, stockShort: true };
+    if (err instanceof OrderChangedError) return { saved: true, stockShort: false };
+    throw err;
+  }
+}
+
 const orders = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 
 // Admin: list all orders, newest first
@@ -226,10 +269,60 @@ orders.get('/', requireAuth, async (c) => {
 orders.get('/pending-count', requireAuth, async (c) => {
   const db = getDb(c.env.DATABASE_URL);
   const [row] = await db
-    .select({ count: sql<number>`cast(count(*) as int)`, lastId: sql<number | null>`max(${ordersTable.id})` })
-    .from(ordersTable)
-    .where(eq(ordersTable.status, 'pending'));
-  return c.json({ count: row?.count ?? 0, lastId: row?.lastId ?? null });
+    .select({
+      toAttend: sql<number>`cast(count(*) filter (where ${NEEDS_PAYMENT}) as int)`,
+      toVerify: sql<number>`cast(count(*) filter (where ${ordersTable.status} = 'review') as int)`,
+      toShip: sql<number>`cast(count(*) filter (where ${ordersTable.status} = 'paid') as int)`,
+      // Newest order placed on the website (orders typed in the panel aren't announced)
+      lastId: sql<number | null>`max(${ordersTable.id}) filter (where ${ordersTable.source} = 'web')`,
+    })
+    .from(ordersTable);
+  const toAttend = row?.toAttend ?? 0;
+  const toVerify = row?.toVerify ?? 0;
+  const toShip = row?.toShip ?? 0;
+  return c.json({ count: toAttend + toVerify + toShip, toAttend, toVerify, toShip, lastId: row?.lastId ?? null });
+});
+
+// Admin: everything the summary page shows, in one call
+orders.get('/dashboard', requireAuth, async (c) => {
+  const db = getDb(c.env.DATABASE_URL);
+  // "Today" is the store's day (Massachusetts), not UTC
+  const today = sql`(now() AT TIME ZONE ${STORE_TIMEZONE})::date`;
+  const localDate = (col: unknown) => sql`((${col}) AT TIME ZONE 'UTC' AT TIME ZONE ${STORE_TIMEZONE})::date`;
+  const [[counts], [messages], [reviews], lowStock, [salesToday]] = await Promise.all([
+    db
+      .select({
+        toAttend: sql<number>`cast(count(*) filter (where ${NEEDS_PAYMENT}) as int)`,
+        toVerify: sql<number>`cast(count(*) filter (where ${ordersTable.status} = 'review') as int)`,
+        stockShort: sql<number>`cast(count(*) filter (where ${ordersTable.status} in ('pending', 'confirmed') and ${ordersTable.paymentRef} is not null) as int)`,
+        toShip: sql<number>`cast(count(*) filter (where ${ordersTable.status} = 'paid') as int)`,
+        paypalWaiting: sql<number>`cast(count(*) filter (where ${ordersTable.status} in ('pending', 'confirmed') and ${ordersTable.paymentMethod} = 'paypal' and ${ordersTable.paymentRef} is null and ${ordersTable.source} = 'web') as int)`,
+        ordersToday: sql<number>`cast(count(*) filter (where ${localDate(ordersTable.createdAt)} = ${today}) as int)`,
+      })
+      .from(ordersTable),
+    db.select({ n: sql<number>`cast(count(*) as int)` }).from(contactMessagesTable).where(eq(contactMessagesTable.read, false)),
+    db.select({ n: sql<number>`cast(count(*) as int)` }).from(testimonialsTable).where(eq(testimonialsTable.status, 'pending')),
+    db
+      .select({ id: productsTable.id, code: productsTable.code, name: productsTable.name, stock: productsTable.stock, minStock: productsTable.minStock })
+      .from(productsTable)
+      .where(and(eq(productsTable.active, true), or(eq(productsTable.stock, 0), sql`${productsTable.stock} <= ${productsTable.minStock}`)))
+      .orderBy(productsTable.stock, productsTable.name),
+    db
+      .select({
+        count: sql<number>`cast(count(*) as int)`,
+        units: sql<number>`cast(coalesce(sum(${salesTable.quantity}), 0) as int)`,
+        total: sql<number>`cast(coalesce(sum(${salesTable.total}), 0) as float8)`,
+      })
+      .from(salesTable)
+      .where(sql`${localDate(salesTable.createdAt)} = ${today}`),
+  ]);
+  return c.json({
+    ...counts,
+    unreadMessages: messages?.n ?? 0,
+    pendingReviews: reviews?.n ?? 0,
+    lowStock,
+    salesToday: { count: salesToday?.count ?? 0, units: salesToday?.units ?? 0, total: toMoney(salesToday?.total ?? 0) },
+  });
 });
 
 // Public: create order (called at checkout).
@@ -286,19 +379,17 @@ orders.post('/', rateLimit('PUBLIC_LIMITER'), async (c) => {
   // The order is already saved; a failed upload shouldn't lose it.
   let receiptUploaded = false;
   if (receipt && order.paymentMethod === 'transfer') {
-    try {
-      const key = `${receiptPrefix(row.id)}${crypto.randomUUID()}.${RECEIPT_TYPES[receipt.type]}`;
-      await c.env.IMAGES.put(key, await receipt.arrayBuffer(), { httpMetadata: { contentType: receipt.type } });
-      receiptUploaded = true;
-    } catch (err) {
-      console.error('Receipt upload failed for order', row.id, err);
-    }
+    receiptUploaded = (await attachReceipt(c.env, db, row, receipt)).saved;
   }
 
+  const menv = await withStore(c.env);
   const mailOrder = toMailOrder(row);
   await inBackground(
     executionCtx(c),
-    Promise.all([sendMail(c.env, orderReceivedMail(c.env, mailOrder)), sendMail(c.env, newOrderStoreMail(c.env, mailOrder))]),
+    Promise.all([
+      sendMail(menv, orderReceivedMail(menv, mailOrder, receiptUploaded)),
+      sendMail(menv, newOrderStoreMail(menv, mailOrder, receiptUploaded)),
+    ]),
   );
 
   return c.json({ id: row.id, total: row.total, receiptUploaded }, 201);
@@ -322,7 +413,10 @@ orders.post('/manual', requireAuth, async (c) => {
     .insert(ordersTable)
     .values({ ...customer.fields, items: priced.items, total: priced.total, source: 'manual' })
     .returning();
-  if (row.customerEmail) await inBackground(executionCtx(c), sendMail(c.env, orderReceivedMail(c.env, toMailOrder(row))));
+  if (row.customerEmail) {
+    const menv = await withStore(c.env);
+    await inBackground(executionCtx(c), sendMail(menv, orderReceivedMail(menv, toMailOrder(row))));
+  }
   return c.json(row, 201);
 });
 
@@ -415,6 +509,8 @@ orders.get('/track', rateLimit('PUBLIC_LIMITER'), async (c) => {
     createdAt: row.createdAt,
     paymentReported: row.paymentRef != null,
     canPay: canPayWithPaypal(row),
+    receiptSent: row.receiptAt != null,
+    canUploadReceipt: row.paymentMethod === 'transfer' && ['pending', 'confirmed'].includes(row.status),
     items: items.map((i) => ({ name: i.name, quantity: i.quantity, subtotal: i.subtotal })),
   });
 });
@@ -505,16 +601,45 @@ orders.post('/:id/paypal', rateLimit('PUBLIC_LIMITER'), async (c) => {
     else if (!(err instanceof OrderChangedError)) throw err;
   }
 
+  const menv = await withStore(c.env);
   const mailOrder = toMailOrder(row);
-  const customerMail = stockShort
-    ? null
-    : statusMail(c.env, mailOrder, 'review');
+  const customerMail = stockShort ? null : statusMail(menv, mailOrder, 'review');
   await inBackground(
     executionCtx(c),
     Promise.all([
-      sendMail(c.env, paypalStoreMail(c.env, mailOrder, captureId, amount, stockShort)),
-      customerMail ? sendMail(c.env, customerMail) : false,
+      sendMail(menv, paypalStoreMail(menv, mailOrder, captureId, amount, stockShort)),
+      customerMail ? sendMail(menv, customerMail) : false,
     ]),
+  );
+  return c.json({ ok: true, stockShort });
+});
+
+// Public: the customer attaches the transfer receipt after ordering (from
+// "Sigue tu pedido"), with the order's phone like /track. Sets the stock
+// aside and tells the store.
+orders.post('/:id/receipt', rateLimit('PUBLIC_LIMITER'), async (c) => {
+  const form = await c.req.parseBody().catch(() => null);
+  const phone = typeof form?.phone === 'string' ? form.phone : '';
+  const file = form?.receipt instanceof File && form.receipt.size > 0 ? form.receipt : null;
+  const db = getDb(c.env.DATABASE_URL);
+  const row = await orderForCustomer(db, parseId(c.req.param('id')), phone);
+  if (!row) return c.json({ error: notFoundMsg }, 404);
+  if (row.paymentMethod !== 'transfer' || !['pending', 'confirmed'].includes(row.status)) {
+    return c.json({ error: 'Este pedido ya no necesita comprobante.' }, 409);
+  }
+  if (!file) return c.json({ error: 'Adjunta la foto o el PDF del comprobante.' }, 400);
+  if (!RECEIPT_TYPES[file.type]) return c.json({ error: 'El comprobante debe ser una imagen (JPG, PNG, WebP) o un PDF.' }, 400);
+  if (file.size > MAX_RECEIPT_BYTES) return c.json({ error: 'El comprobante no puede superar los 5 MB.' }, 400);
+
+  const { saved, stockShort } = await attachReceipt(c.env, db, row, file);
+  if (!saved) return c.json({ error: 'No pudimos guardar el comprobante. Intenta de nuevo.' }, 500);
+
+  const menv = await withStore(c.env);
+  const mailOrder = toMailOrder(row);
+  const customerMail = stockShort ? null : statusMail(menv, mailOrder, 'review');
+  await inBackground(
+    executionCtx(c),
+    Promise.all([sendMail(menv, receiptStoreMail(menv, mailOrder, stockShort)), customerMail ? sendMail(menv, customerMail) : false]),
   );
   return c.json({ ok: true, stockShort });
 });
@@ -523,8 +648,9 @@ orders.post('/:id/paypal', rateLimit('PUBLIC_LIMITER'), async (c) => {
 orders.get('/:id/receipt', requireAuth, async (c) => {
   const id = parseId(c.req.param('id'));
   if (!id) return c.json({ error: 'Not found' }, 404);
-  const listed = await c.env.IMAGES.list({ prefix: receiptPrefix(id), limit: 1 });
-  const key = listed.objects[0]?.key;
+  // Keys start with the upload time, so the last one listed is the newest
+  const listed = await c.env.IMAGES.list({ prefix: receiptPrefix(id) });
+  const key = listed.objects.at(-1)?.key;
   const object = key ? await c.env.IMAGES.get(key) : null;
   if (!object) return c.json({ error: 'Este pedido no tiene comprobante.' }, 404);
   return new Response(object.body, {
@@ -586,8 +712,9 @@ orders.patch('/:id/status', requireAuth, async (c) => {
 
   const [row] = await db.select().from(ordersTable).where(eq(ordersTable.id, id));
   // Tell the customer, except when going back to "pending"
-  const mail = statusMail(c.env, toMailOrder(row), status);
-  if (mail) await inBackground(executionCtx(c), sendMail(c.env, mail));
+  const menv = await withStore(c.env);
+  const mail = statusMail(menv, toMailOrder(row), status);
+  if (mail) await inBackground(executionCtx(c), sendMail(menv, mail));
   return c.json(row);
 });
 

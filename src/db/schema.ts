@@ -116,6 +116,9 @@ export const testimonialsTable = pgTable('testimonials', {
   text: text('text').notNull(),
   textEn: text('text_en').notNull().default(''),
   avatar: text('avatar').notNull().default(''),
+  // Only the store sees these two (to check the review is from a real buyer)
+  email: text('email').notNull().default(''),
+  productPurchased: text('product_purchased').notNull().default(''),
   status: text('status').notNull().default('pending'), // pending | approved | rejected
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
@@ -173,6 +176,8 @@ export const ordersTable = pgTable('orders', {
   source: text('source').notNull().default('web'),
   // Only the store sees these
   adminNotes: text('admin_notes').notNull().default(''),
+  // When the customer attached the transfer receipt (null: none yet)
+  receiptAt: timestamp('receipt_at'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 

@@ -93,6 +93,7 @@ beforeAll(async () => {
 beforeEach(async () => {
   bucket = fakeBucket();
   sentMails.length = 0;
+  (await import('../src/storeSettings')).clearSettingsCache();
   await client.exec(`
     TRUNCATE password_resets, settings, contact_messages, orders, sales, stock_products, product_images, products, subcategories, categories, users RESTART IDENTITY CASCADE;
     INSERT INTO users (username, email, password_hash) VALUES ('ana', 'ana@test.dev', 'x');
@@ -420,11 +421,14 @@ describe('pending order count', () => {
   it('counts pending orders and reports the newest one', async () => {
     expect((await call('/api/orders/pending-count')).status).toBe(401);
     const empty = await call('/api/orders/pending-count', {}, true);
-    expect(await empty.json()).toEqual({ count: 0, lastId: null });
+    expect(await empty.json()).toEqual({ count: 0, toAttend: 0, toVerify: 0, toShip: 0, lastId: null });
     await call('/api/orders', json({ ...customer, items: [{ productId: 1, quantity: 1 }] }));
     await call('/api/orders', json({ ...customer, items: [{ productId: 2, quantity: 1 }] }));
-    await call('/api/orders/1/status', { method: 'PATCH', body: JSON.stringify({ status: 'confirmed' }) }, true);
-    expect(await (await call('/api/orders/pending-count', {}, true)).json()).toEqual({ count: 1, lastId: 2 });
+    await call('/api/orders', json({ ...customer, paymentMethod: 'paypal', items: [{ productId: 2, quantity: 1 }] })); // waits for the customer
+    await call('/api/orders/manual', json({ name: 'Rosa', phone: '4135550001', paymentMethod: 'cash', items: [{ productId: 1, quantity: 1 }] }), true);
+    await call('/api/orders/1/status', { method: 'PATCH', body: JSON.stringify({ status: 'paid' }) }, true);
+    // 2 and 4 need the payment collected, 1 must be shipped; 3 (PayPal) isn't counted; 4 (panel) isn't announced
+    expect(await (await call('/api/orders/pending-count', {}, true)).json()).toEqual({ count: 3, toAttend: 2, toVerify: 0, toShip: 1, lastId: 3 });
   });
 });
 
@@ -543,11 +547,13 @@ describe('PayPal payments', () => {
     await call('/api/orders', json({ ...customer, items: [{ productId: 1, quantity: 1 }] })); // 3: transfer -> stays
     await paypalOrder(); // 4: old but paid -> stays
     await report(4);
-    await client.exec("UPDATE orders SET created_at = now() - interval '25 hours' WHERE id IN (1, 3, 4)");
+    // 5: typed in the panel with PayPal -> the operator collects it, never expires
+    await call('/api/orders/manual', json({ name: 'Rosa', phone: '4135550001', paymentMethod: 'paypal', items: [{ productId: 1, quantity: 1 }] }), true);
+    await client.exec("UPDATE orders SET created_at = now() - interval '25 hours' WHERE id IN (1, 3, 4, 5)");
     sentMails.length = 0;
     expect(await expireUnpaidPaypalOrders(testDb as never, {})).toBe(1);
     const statuses = Object.fromEntries((await orderList()).map((o) => [o.id, o.status]));
-    expect(statuses).toEqual({ 1: 'cancelled', 2: 'pending', 3: 'pending', 4: 'review' });
+    expect(statuses).toEqual({ 1: 'cancelled', 2: 'pending', 3: 'pending', 4: 'review', 5: 'pending' });
     expect(sentMails).toEqual([expect.objectContaining({ to: 'ana@cliente.test', subject: expect.stringContaining('cancelado') })]);
   });
 });
@@ -815,5 +821,121 @@ describe('deleting a product', () => {
     bucket.objects.set('products/4/a.jpg', { bytes: new ArrayBuffer(1) });
     expect((await call('/api/products/4', { method: 'DELETE' }, true)).status).toBe(200);
     expect(bucket.objects.has('products/4/a.jpg')).toBe(false);
+  });
+});
+
+describe('transfer receipts', () => {
+  const receiptForm = (phone: string, withFile = true) => {
+    const form = new FormData();
+    form.append('phone', phone);
+    if (withFile) form.append('receipt', new File([new Uint8Array([9])], 'pago.jpg', { type: 'image/jpeg' }));
+    return { method: 'POST', body: form } as RequestInit;
+  };
+  const stockOf = async (id: number) =>
+    Number((await client.query<{ stock: number }>(`SELECT stock FROM products WHERE id = ${id}`)).rows[0].stock);
+
+  it('a receipt at checkout sets the stock aside and tells the store', async () => {
+    const form = new FormData();
+    form.append('data', JSON.stringify({ ...customer, items: [{ productId: 1, quantity: 2 }] }));
+    form.append('receipt', new File([new Uint8Array([1])], 'pago.png', { type: 'image/png' }));
+    await call('/api/orders', { method: 'POST', body: form });
+    const [order] = (await (await call('/api/orders', {}, true)).json()) as Array<Record<string, unknown>>;
+    expect(order).toMatchObject({ status: 'review' });
+    expect(order.receiptAt).toBeTruthy();
+    expect(await stockOf(1)).toBe(3);
+    expect(sentMails.find((m) => m.to === 'alexandrajewelry2@gmail.com')?.subject).toContain('CON COMPROBANTE');
+  });
+
+  it('the customer can attach it later from the tracking page', async () => {
+    await call('/api/orders', json({ ...customer, phone: '413-555-0009', items: [{ productId: 2, quantity: 1 }] }));
+    const tracked = await (await call('/api/orders/track?id=1&phone=4135550009')).json();
+    expect(tracked).toMatchObject({ canUploadReceipt: true, receiptSent: false });
+
+    expect((await call('/api/orders/1/receipt', receiptForm('000000'))).status).toBe(404);
+    expect((await call('/api/orders/1/receipt', receiptForm('4135550009', false))).status).toBe(400);
+    sentMails.length = 0;
+    const res = await call('/api/orders/1/receipt', receiptForm('4135550009'));
+    expect(await res.json()).toEqual({ ok: true, stockShort: false });
+    expect(await stockOf(2)).toBe(1);
+    expect(sentMails.map((m) => m.subject).join(' | ')).toContain('Comprobante de pago - Pedido #1');
+    expect(await (await call('/api/orders/track?id=1&phone=4135550009')).json()).toMatchObject({ status: 'review', receiptSent: true, canUploadReceipt: false });
+
+    // The admin sees the newest receipt
+    const receipt = await call('/api/orders/1/receipt', {}, true);
+    expect(receipt.headers.get('Content-Type')).toBe('image/jpeg');
+  });
+
+  it('only for transfer orders still waiting', async () => {
+    await call('/api/orders', json({ ...customer, phone: '413-555-0009', paymentMethod: 'whatsapp', items: [{ productId: 2, quantity: 1 }] }));
+    expect((await call('/api/orders/1/receipt', receiptForm('4135550009'))).status).toBe(409);
+  });
+});
+
+describe('store settings', () => {
+  const put = (path: string, body: unknown) => call(`/api/settings/${path}`, { method: 'PUT', body: JSON.stringify(body) }, true);
+
+  it('saves the store details and shows the public part to the site', async () => {
+    const before = (await (await call('/api/settings/public')).json()) as { store: Record<string, unknown>; bankAccounts: unknown[] };
+    expect(before.store).toMatchObject({ name: 'Alexandra Jewelry', phone: '413-770-9901', hours: '' });
+    expect(before.store).not.toHaveProperty('notifyEmail');
+    expect(before.bankAccounts).toEqual([]);
+
+    expect((await put('store', { name: 'Alexandra Jewelry', notifyEmail: 'mal' })).status).toBe(400);
+    const saved = await put('store', {
+      name: 'Alexandra Jewelry', street: '16 Ashland Street', cityLine: 'North Adams, MA 01247', phone: '413-770-9901',
+      whatsapp: '(413) 770-9901', email: 'tienda@test.dev', notifyEmail: 'avisos@test.dev', hours: 'Lunes a viernes: 10 a 6', topbarMessage: '',
+    });
+    expect(await saved.json()).toMatchObject({ whatsapp: '14137709901', notifyEmail: 'avisos@test.dev' });
+    const after = (await (await call('/api/settings/public')).json()) as { store: Record<string, unknown> };
+    expect(after.store).toMatchObject({ hours: 'Lunes a viernes: 10 a 6', email: 'tienda@test.dev' });
+
+    // Store notices now go to the new inbox
+    await call('/api/contact', json({ name: 'Luisa', email: 'luisa@test.dev', message: 'Hola' }));
+    expect(sentMails.at(-1)?.to).toBe('avisos@test.dev');
+  });
+
+  it('saves bank accounts and sends them with transfer orders', async () => {
+    expect((await put('bank', { accounts: [{ bank: 'Chase', holder: '', number: '123' }] })).status).toBe(400);
+    const accounts = [
+      { bank: 'Chase', holder: 'Alexandra R.', number: '000123456', details: 'Routing 021000021' },
+      { bank: 'Bank of America', holder: 'Alexandra R.', number: '987654', details: '' },
+    ];
+    expect((await put('bank', { accounts })).status).toBe(200);
+    const pub = (await (await call('/api/settings/public')).json()) as { bankAccounts: unknown[] };
+    expect(pub.bankAccounts).toEqual(accounts);
+
+    const { orderReceivedMail, withStore } = await import('../src/mail');
+    const menv = await withStore({ DATABASE_URL: 'unused' });
+    const mail = orderReceivedMail(menv, { id: 7, customerName: 'Ana', customerEmail: 'ana@x.dev', customerPhone: '', customerAddress: '', customerCity: '', notes: '', paymentMethod: 'transfer', total: 10, items: [] });
+    expect(mail.text).toContain('Chase | Titular: Alexandra R. | Cuenta: 000123456');
+  });
+
+  it('is for administrators only', async () => {
+    expect((await call('/api/settings/store')).status).toBe(401);
+    expect((await call('/api/settings/bank')).status).toBe(401);
+  });
+});
+
+describe('summary page', () => {
+  it('counts what needs the operator and the sales of the day', async () => {
+    await client.exec('UPDATE products SET min_stock = 3 WHERE id = 2');
+    await call('/api/orders', json({ ...customer, items: [{ productId: 1, quantity: 1 }] }));
+    await call('/api/orders', json({ ...customer, paymentMethod: 'paypal', items: [{ productId: 1, quantity: 1 }] }));
+    await call('/api/sales', json({ productId: 1, quantity: 2 }), true);
+    await call('/api/contact', json({ name: 'Luisa', email: 'luisa@test.dev', message: 'Hola' }));
+
+    expect((await call('/api/orders/dashboard')).status).toBe(401);
+    const d = (await (await call('/api/orders/dashboard', {}, true)).json()) as Record<string, unknown>;
+    expect(d).toMatchObject({ toAttend: 1, toVerify: 0, toShip: 0, paypalWaiting: 1, ordersToday: 2, unreadMessages: 1, pendingReviews: 0 });
+    expect(d.salesToday).toEqual({ count: 1, units: 2, total: 241 });
+    expect(d.lowStock).toEqual([expect.objectContaining({ code: 'C1', stock: 2, minStock: 3 })]);
+  });
+});
+
+describe('reviews', () => {
+  it('keep the email and product for the store only', async () => {
+    await call('/api/testimonials', json({ name: 'Eva', text: 'Hermoso', rating: 5, email: 'eva@test.dev', productPurchased: 'Anillo' }));
+    const [admin] = (await (await call('/api/admin/testimonials?status=pending', {}, true)).json()) as Array<Record<string, unknown>>;
+    expect(admin).toMatchObject({ email: 'eva@test.dev', productPurchased: 'Anillo' });
   });
 });

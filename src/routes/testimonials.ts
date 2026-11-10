@@ -16,6 +16,8 @@ const testimonialSpec = {
   text: { type: 'string', min: 1, max: 1000 },
   rating: { type: 'number', integer: true, min: 1, max: 5 },
   location: { type: 'string', max: 80 },
+  email: { type: 'string', max: 200 },
+  productPurchased: { type: 'string', max: 120 },
 } as const;
 
 // ── Public router ─────────────────────────────────────────────────────────────
@@ -35,7 +37,6 @@ testimonials.get('/approved', async (c) => {
 
 // POST /api/testimonials — visitor submits a new review (pending)
 testimonials.post('/', rateLimit('PUBLIC_LIMITER'), async (c) => {
-  // email and productPurchased are collected by the form but not yet in the DB schema
   const parsed = parseFields(await c.req.json<unknown>(), testimonialSpec, ['name', 'text']);
   if (!parsed.ok) return c.json({ error: parsed.error }, 400);
   const body = parsed.data;
@@ -48,6 +49,8 @@ testimonials.post('/', rateLimit('PUBLIC_LIMITER'), async (c) => {
       text: body.text,
       rating: body.rating ?? 5,
       location: body.location ?? '',
+      email: (body.email ?? '').trim(),
+      productPurchased: (body.productPurchased ?? '').trim(),
       status: 'pending',
     })
     .returning();
