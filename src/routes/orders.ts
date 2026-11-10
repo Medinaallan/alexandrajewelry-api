@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
-import { and, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
-import { getDb } from '../db';
+import { and, desc, eq, inArray, isNull, lt, sql } from 'drizzle-orm';
+import { getDb, type Db } from '../db';
 import { ordersTable, productsTable } from '../db/schema';
 import { requireAuth } from '../middleware/auth';
 import {
@@ -12,15 +12,31 @@ import {
 } from '../db/inventory';
 import { rateLimit } from '../middleware/rateLimit';
 import { parseFields, parseId, toMoney } from '../utils/validate';
+import {
+  executionCtx,
+  inBackground,
+  isEmail,
+  newOrderStoreMail,
+  orderReceivedMail,
+  paypalStoreMail,
+  sendMail,
+  statusMail,
+  type MailEnv,
+  type OrderForMail,
+} from '../mail';
 
-type Bindings = { DATABASE_URL: string; JWT_SECRET: string; IMAGES: R2Bucket };
+type Bindings = { DATABASE_URL: string; JWT_SECRET: string; IMAGES: R2Bucket } & MailEnv;
 type Variables = { username: string };
 
 const PAYMENT_METHODS = ['transfer', 'googlepay', 'paypal', 'whatsapp'];
-const ORDER_STATUSES = ['pending', 'confirmed', 'paid', 'shipped', 'delivered', 'cancelled'];
+// `review`: the customer reported a PayPal payment the admin has not checked yet.
+const ORDER_STATUSES = ['pending', 'confirmed', 'review', 'paid', 'shipped', 'delivered', 'cancelled'];
 // In these statuses the order's units are out of stock and counted as sales.
 // Entering one sells the items; leaving to any other status undoes that.
-const STOCK_TAKEN = new Set(['paid', 'shipped', 'delivered']);
+const STOCK_TAKEN = new Set(['review', 'paid', 'shipped', 'delivered']);
+
+/** An unpaid PayPal order is cancelled this long after it was placed. */
+export const PAYPAL_HOLD_MS = 24 * 60 * 60 * 1000;
 
 type OrderItem = { productId: number; name: string; price: number; quantity: number };
 
@@ -36,6 +52,7 @@ const RECEIPT_TYPES: Record<string, string> = {
 const orderSpec = {
   name: { type: 'string', min: 1, max: 120 },
   phone: { type: 'string', min: 1, max: 40 },
+  email: { type: 'string', min: 1, max: 200 },
   address: { type: 'string', min: 1, max: 300 },
   city: { type: 'string', min: 1, max: 120 },
   notes: { type: 'string', max: 1000 },
@@ -50,6 +67,61 @@ const itemSpec = {
 // Transfer receipts live under this prefix in R2 and are only served through
 // the authenticated endpoint below.
 const receiptPrefix = (orderId: number) => `receipts/${orderId}/`;
+
+type OrderRow = typeof ordersTable.$inferSelect;
+
+function toMailOrder(row: OrderRow): OrderForMail {
+  const items = (Array.isArray(row.items) ? row.items : []) as Array<OrderItem & { subtotal?: number }>;
+  return {
+    id: row.id,
+    customerName: row.customerName,
+    customerEmail: row.customerEmail,
+    customerPhone: row.customerPhone,
+    customerAddress: row.customerAddress,
+    customerCity: row.customerCity,
+    notes: row.notes,
+    paymentMethod: row.paymentMethod,
+    total: row.total,
+    items: items.map((i) => ({ name: i.name, quantity: i.quantity, subtotal: i.subtotal ?? toMoney(i.price * i.quantity) })),
+  };
+}
+
+/** A PayPal order still waiting for its payment, within its 24 hours. */
+function canPayWithPaypal(row: OrderRow, now = Date.now()): boolean {
+  return (
+    row.paymentMethod === 'paypal' &&
+    (row.status === 'pending' || row.status === 'confirmed') &&
+    row.paymentRef == null &&
+    now - new Date(row.createdAt).getTime() < PAYPAL_HOLD_MS
+  );
+}
+
+/**
+ * Cancels PayPal orders nobody paid within 24 hours and tells each customer.
+ * Run by the hourly cron. No stock to return: unpaid orders never took any.
+ */
+export async function expireUnpaidPaypalOrders(db: Db, env: MailEnv): Promise<number> {
+  const cutoff = new Date(Date.now() - PAYPAL_HOLD_MS);
+  const expired = await db
+    .update(ordersTable)
+    .set({ status: 'cancelled' })
+    .where(
+      and(
+        eq(ordersTable.paymentMethod, 'paypal'),
+        inArray(ordersTable.status, ['pending', 'confirmed']),
+        isNull(ordersTable.paymentRef),
+        lt(ordersTable.createdAt, cutoff),
+      ),
+    )
+    .returning();
+  await Promise.all(
+    expired.map((row) => {
+      const mail = statusMail(env, toMailOrder(row), 'cancelled', 'No recibimos el pago dentro de las 24 horas.');
+      return mail ? sendMail(env, mail) : false;
+    }),
+  );
+  return expired.length;
+}
 
 const orders = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 
@@ -89,10 +161,11 @@ orders.post('/', rateLimit('PUBLIC_LIMITER'), async (c) => {
     payload = await c.req.json<unknown>();
   }
 
-  const parsed = parseFields(payload, orderSpec, ['name', 'phone', 'address', 'city', 'paymentMethod']);
+  const parsed = parseFields(payload, orderSpec, ['name', 'phone', 'email', 'address', 'city', 'paymentMethod']);
   if (!parsed.ok) return c.json({ error: parsed.error }, 400);
   const order = parsed.data;
   if (!PAYMENT_METHODS.includes(order.paymentMethod)) return c.json({ error: 'Invalid payment method' }, 400);
+  if (!isEmail(order.email)) return c.json({ error: 'Escribe un correo electrónico válido.' }, 400);
 
   const rawItems = (payload as { items?: unknown }).items;
   if (!Array.isArray(rawItems) || rawItems.length === 0 || rawItems.length > MAX_ITEMS) {
@@ -154,6 +227,7 @@ orders.post('/', rateLimit('PUBLIC_LIMITER'), async (c) => {
     .values({
       customerName: order.name,
       customerPhone: order.phone,
+      customerEmail: order.email,
       customerAddress: order.address,
       customerCity: order.city,
       notes: order.notes ?? '',
@@ -174,6 +248,12 @@ orders.post('/', rateLimit('PUBLIC_LIMITER'), async (c) => {
       console.error('Receipt upload failed for order', row.id, err);
     }
   }
+
+  const mailOrder = toMailOrder(row);
+  await inBackground(
+    executionCtx(c),
+    Promise.all([sendMail(c.env, orderReceivedMail(c.env, mailOrder)), sendMail(c.env, newOrderStoreMail(c.env, mailOrder))]),
+  );
 
   return c.json({ id: row.id, total: row.total, receiptUploaded }, 201);
 });
@@ -200,22 +280,58 @@ orders.get('/track', rateLimit('PUBLIC_LIMITER'), async (c) => {
     total: row.total,
     createdAt: row.createdAt,
     paymentReported: row.paymentRef != null,
+    canPay: canPayWithPaypal(row),
     items: items.map((i) => ({ name: i.name, quantity: i.quantity, subtotal: i.subtotal })),
   });
 });
 
 // PayPal ids are uppercase letters and digits (capture ids are 17 long).
 const PAYPAL_ID = /^[A-Z0-9]{10,40}$/;
-// Before payment the order is waiting; afterwards the admin moves it on.
-const PAYABLE = ['pending', 'confirmed'];
+
+const notFoundMsg = 'No encontramos un pedido con ese número y teléfono.';
+
+/** The order, if the phone matches (the phone works as in /track). */
+async function orderForCustomer(db: Db, id: number | null, phone: string): Promise<OrderRow | null> {
+  if (!id) return null;
+  const [row] = await db.select().from(ordersTable).where(eq(ordersTable.id, id));
+  return row && phoneDigits(row.customerPhone) === phoneDigits(phone) ? row : null;
+}
+
+/** First product of the order without enough stock, if any. */
+async function shortItem(db: Db, row: OrderRow) {
+  const items = (Array.isArray(row.items) ? row.items : []) as OrderItem[];
+  const stock = await db
+    .select({ id: productsTable.id, stock: productsTable.stock })
+    .from(productsTable)
+    .where(inArray(productsTable.id, items.map((i) => i.productId)));
+  const short = items.find((i) => (stock.find((p) => p.id === i.productId)?.stock ?? 0) < i.quantity);
+  return short ? { ...short, available: stock.find((p) => p.id === short.productId)?.stock ?? 0 } : null;
+}
+
+// Public: called right before opening PayPal, so nobody pays for an order
+// that expired or whose products sold out meanwhile. Answers the amount to charge.
+orders.post('/:id/paypal/check', rateLimit('PUBLIC_LIMITER'), async (c) => {
+  const body = await c.req.json<{ phone?: unknown }>().catch(() => ({}) as { phone?: unknown });
+  const db = getDb(c.env.DATABASE_URL);
+  const row = await orderForCustomer(db, parseId(c.req.param('id')), typeof body.phone === 'string' ? body.phone : '');
+  if (!row) return c.json({ error: notFoundMsg }, 404);
+  if (!canPayWithPaypal(row)) {
+    return c.json({ error: 'Este pedido ya no se puede pagar (venció, ya tiene un pago o fue cancelado).' }, 409);
+  }
+  const short = await shortItem(db, row);
+  if (short) {
+    return c.json({ error: `Lo sentimos: "${short.name}" se agotó. Escríbenos y te ayudamos con tu pedido.` }, 409);
+  }
+  return c.json({ total: row.total });
+});
 
 // Public: the customer's browser reports a PayPal payment for the order.
-// The API has no PayPal secret, so this is NOT a proof of payment: it only
-// stores the capture id and amount for the admin, who checks them in PayPal
-// before marking the order paid. The phone works as in /track, and only the
-// first report is kept.
+// The API has no PayPal secret, so this is NOT a proof of payment: the admin
+// checks it in PayPal. To keep two customers from paying for the same last
+// unit, the stock is taken right away (status `review`); if it ran out, the
+// payment is still noted and the admin is warned to restock or refund.
+// Only the first report is kept.
 orders.post('/:id/paypal', rateLimit('PUBLIC_LIMITER'), async (c) => {
-  const id = parseId(c.req.param('id'));
   const body = await c.req.json<unknown>().catch(() => null);
   const parsed = parseFields(body, {
     phone: { type: 'string', min: 1, max: 40 },
@@ -226,22 +342,47 @@ orders.post('/:id/paypal', rateLimit('PUBLIC_LIMITER'), async (c) => {
   const { phone, captureId, amount } = parsed.data;
   if (!PAYPAL_ID.test(captureId)) return c.json({ error: 'Invalid capture id' }, 400);
 
-  const notFound = () => c.json({ error: 'No encontramos un pedido con ese número y teléfono.' }, 404);
-  if (!id) return notFound();
   const db = getDb(c.env.DATABASE_URL);
-  const [row] = await db.select().from(ordersTable).where(eq(ordersTable.id, id));
-  if (!row || phoneDigits(row.customerPhone) !== phoneDigits(phone)) return notFound();
-  if (row.paymentMethod !== 'paypal' || !PAYABLE.includes(row.status)) {
+  const row = await orderForCustomer(db, parseId(c.req.param('id')), phone);
+  if (!row) return c.json({ error: notFoundMsg }, 404);
+  // A late payment (after 24 h but before the cron cancelled it) is still kept.
+  if (row.paymentMethod !== 'paypal' || !['pending', 'confirmed'].includes(row.status)) {
     return c.json({ error: 'Este pedido no espera un pago con PayPal.' }, 409);
   }
 
-  const updated = await db
+  const noted = await db
     .update(ordersTable)
     .set({ paymentRef: captureId, paymentAmount: toMoney(amount) })
-    .where(and(eq(ordersTable.id, id), isNull(ordersTable.paymentRef)))
+    .where(and(eq(ordersTable.id, row.id), isNull(ordersTable.paymentRef)))
     .returning({ id: ordersTable.id });
-  if (updated.length === 0) return c.json({ error: 'Este pedido ya tiene un pago registrado.' }, 409);
-  return c.json({ ok: true });
+  if (noted.length === 0) return c.json({ error: 'Este pedido ya tiene un pago registrado.' }, 409);
+
+  let stockShort = false;
+  try {
+    const items = (Array.isArray(row.items) ? row.items : []) as OrderItem[];
+    await registerSales(
+      db,
+      items.map((i) => ({ productId: i.productId, quantity: i.quantity, unitPrice: i.price, notes: `Pedido #${row.id} (PayPal)` })),
+      'PayPal',
+      { id: row.id, from: row.status, to: 'review' },
+    );
+  } catch (err) {
+    if (err instanceof InsufficientStockError) stockShort = true;
+    else if (!(err instanceof OrderChangedError)) throw err;
+  }
+
+  const mailOrder = toMailOrder(row);
+  const customerMail = stockShort
+    ? null
+    : statusMail(c.env, mailOrder, 'review');
+  await inBackground(
+    executionCtx(c),
+    Promise.all([
+      sendMail(c.env, paypalStoreMail(c.env, mailOrder, captureId, amount, stockShort)),
+      customerMail ? sendMail(c.env, customerMail) : false,
+    ]),
+  );
+  return c.json({ ok: true, stockShort });
 });
 
 // Admin: download the transfer receipt attached to an order
@@ -282,15 +423,10 @@ orders.patch('/:id/status', requireAuth, async (c) => {
     if (takes) {
       const items = (Array.isArray(current.items) ? current.items : []) as OrderItem[];
       // Friendly message naming the product; registerSales re-checks atomically.
-      const stock = await db
-        .select({ id: productsTable.id, stock: productsTable.stock })
-        .from(productsTable)
-        .where(inArray(productsTable.id, items.map((i) => i.productId)));
-      const short = items.find((i) => (stock.find((p) => p.id === i.productId)?.stock ?? 0) < i.quantity);
+      const short = await shortItem(db, current);
       if (short) {
-        const available = stock.find((p) => p.id === short.productId)?.stock ?? 0;
         return c.json({
-          error: `No hay stock suficiente de "${short.name}" (pide ${short.quantity}, hay ${available}). Agrega stock antes de marcar el pedido.`,
+          error: `No hay stock suficiente de "${short.name}" (pide ${short.quantity}, hay ${short.available}). Agrega stock antes de marcar el pedido.`,
         }, 409);
       }
       await registerSales(
@@ -315,6 +451,9 @@ orders.patch('/:id/status', requireAuth, async (c) => {
   }
 
   const [row] = await db.select().from(ordersTable).where(eq(ordersTable.id, id));
+  // Tell the customer, except when going back to "pending"
+  const mail = statusMail(c.env, toMailOrder(row), status);
+  if (mail) await inBackground(executionCtx(c), sendMail(c.env, mail));
   return c.json(row);
 });
 

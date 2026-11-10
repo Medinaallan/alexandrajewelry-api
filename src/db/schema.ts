@@ -140,6 +140,8 @@ export const ordersTable = pgTable('orders', {
   id: serial('id').primaryKey(),
   customerName: text('customer_name').notNull(),
   customerPhone: text('customer_phone').notNull(),
+  // Where status notices are sent ('' on orders from before it was asked)
+  customerEmail: text('customer_email').notNull().default(''),
   customerAddress: text('customer_address').notNull().default(''),
   customerCity: text('customer_city').notNull().default(''),
   notes: text('notes').notNull().default(''),
@@ -152,4 +154,27 @@ export const ordersTable = pgTable('orders', {
   paymentRef: text('payment_ref'),
   paymentAmount: money('payment_amount'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+// ─── Contact messages ─────────────────────────────────────────────────────────
+
+export const contactMessagesTable = pgTable('contact_messages', {
+  id: serial('id').primaryKey(),
+  name: text('name').notNull(),
+  email: text('email').notNull(),
+  phone: text('phone').notNull().default(''),
+  message: text('message').notNull(),
+  read: boolean('read').notNull().default(false),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+// ─── Settings ─────────────────────────────────────────────────────────────────
+
+// Store settings editable from the admin panel, one JSON value per key.
+// Secrets inside a value (like the SMTP password) are stored encrypted.
+export const settingsTable = pgTable('settings', {
+  key: text('key').primaryKey(),
+  value: jsonb('value').notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+  updatedBy: text('updated_by').notNull().default(''),
 });

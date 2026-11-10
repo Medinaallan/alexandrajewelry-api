@@ -15,7 +15,25 @@ const client = new PGlite();
 const testDb = drizzle(client);
 vi.mock('../src/db', () => ({ getDb: () => testDb }));
 
-const { default: app } = await import('../src/index');
+// Emails are recorded, not sent
+const sentMails: Array<{ to: string; subject: string }> = [];
+vi.mock('../src/mail', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../src/mail')>();
+  return {
+    ...real,
+    sendMail: vi.fn(async (_env: unknown, mail: { to: string; subject: string }) => {
+      sentMails.push({ to: mail.to, subject: mail.subject });
+      return true;
+    }),
+    // What the test button would send with (the real SMTP isn't reachable here)
+    deliver: vi.fn(async (config: { user: string; pass: string }, mail: { to: string; subject: string }) => {
+      if (config.pass !== 'abcdefghijklmnop') throw new Error('535 Authentication failed');
+      sentMails.push({ to: mail.to, subject: `${mail.subject} via ${config.user}` });
+    }),
+  };
+});
+
+const { app } = await import('../src/index');
 
 /** Minimal stand-in for the R2 bucket binding. */
 function fakeBucket() {
@@ -60,7 +78,7 @@ function call(path: string, init: RequestInit = {}, auth = false) {
 
 const json = (body: unknown): RequestInit => ({ method: 'POST', body: JSON.stringify(body) });
 
-const customer = { name: 'Ana', phone: '555', address: 'Calle 1', city: 'Caracas', notes: '', paymentMethod: 'transfer' };
+const customer = { name: 'Ana', phone: '555', email: 'ana@cliente.test', address: 'Calle 1', city: 'Caracas', notes: '', paymentMethod: 'transfer' };
 
 beforeAll(async () => {
   const statements = await generateMigration(generateDrizzleJson({}), generateDrizzleJson(schema));
@@ -73,8 +91,9 @@ beforeAll(async () => {
 
 beforeEach(async () => {
   bucket = fakeBucket();
+  sentMails.length = 0;
   await client.exec(`
-    TRUNCATE orders, sales, stock_products, product_images, products, subcategories, categories, users RESTART IDENTITY CASCADE;
+    TRUNCATE settings, contact_messages, orders, sales, stock_products, product_images, products, subcategories, categories, users RESTART IDENTITY CASCADE;
     INSERT INTO users (username, email, password_hash) VALUES ('ana', 'ana@test.dev', 'x');
     INSERT INTO categories (name, name_en, slug) VALUES ('Anillos', 'Rings', 'anillos');
     INSERT INTO subcategories (category_id, name, name_en, slug) VALUES (1, 'Oro', 'Gold', 'oro');
@@ -452,28 +471,171 @@ describe('users', () => {
   });
 });
 
-describe('PayPal payment report', () => {
-  const report = (id: number, body: Record<string, unknown>) =>
+describe('PayPal payments', () => {
+  const report = (id: number, body: Record<string, unknown> = {}) =>
     call(`/api/orders/${id}/paypal`, json({ phone: '4125551234', captureId: '3C679366HH908993F', amount: 120.5, ...body }));
+  const paypalOrder = (productId = 1, quantity = 1) =>
+    call('/api/orders', json({ ...customer, phone: '412-555-1234', paymentMethod: 'paypal', items: [{ productId, quantity }] }));
+  const stockOf = async (id: number) =>
+    Number((await client.query<{ stock: number }>(`SELECT stock FROM products WHERE id = ${id}`)).rows[0].stock);
+  const orderList = async () => (await (await call('/api/orders', {}, true)).json()) as Array<Record<string, unknown>>;
 
-  it('stores the first report for a waiting PayPal order and shows it to the admin', async () => {
-    await call('/api/orders', json({ ...customer, phone: '412-555-1234', paymentMethod: 'paypal', items: [{ productId: 1, quantity: 1 }] }));
-    expect((await report(1, {})).status).toBe(200);
+  it('takes the stock when the payment is reported and keeps only the first report', async () => {
+    await paypalOrder(1, 2);
+    sentMails.length = 0;
+    const res = await report(1, { amount: 241 });
+    expect(await res.json()).toEqual({ ok: true, stockShort: false });
     expect((await report(1, { captureId: '9AB12345678901234' })).status).toBe(409);
-    const [order] = (await (await call('/api/orders', {}, true)).json()) as Array<Record<string, unknown>>;
-    expect(order).toMatchObject({ paymentRef: '3C679366HH908993F', paymentAmount: 120.5, status: 'pending' });
+    const [order] = await orderList();
+    expect(order).toMatchObject({ paymentRef: '3C679366HH908993F', paymentAmount: 241, status: 'review' });
+    expect(await stockOf(1)).toBe(3);
+    expect(sentMails.map((m) => m.to).sort()).toEqual(['alexandrajewelry2@gmail.com', 'ana@cliente.test']);
     const tracked = await (await call('/api/orders/track?id=1&phone=4125551234')).json();
-    expect(tracked).toMatchObject({ paymentReported: true });
+    expect(tracked).toMatchObject({ status: 'review', paymentReported: true, canPay: false });
+
+    // Verified: review -> paid keeps the stock; cancelling returns it
+    const patch = (status: string) => call('/api/orders/1/status', { method: 'PATCH', body: JSON.stringify({ status }) }, true);
+    expect((await patch('paid')).status).toBe(200);
+    expect(await stockOf(1)).toBe(3);
+    expect((await patch('cancelled')).status).toBe(200);
+    expect(await stockOf(1)).toBe(5);
+  });
+
+  it('notes the payment but warns when the stock ran out meanwhile', async () => {
+    await paypalOrder(2, 2);
+    await client.exec('UPDATE products SET stock = 1 WHERE id = 2');
+    sentMails.length = 0;
+    expect(await (await report(1, { amount: 160 })).json()).toEqual({ ok: true, stockShort: true });
+    const [order] = await orderList();
+    expect(order).toMatchObject({ status: 'pending', paymentRef: '3C679366HH908993F' });
+    expect(await stockOf(2)).toBe(1);
+    expect(sentMails).toEqual([expect.objectContaining({ to: 'alexandrajewelry2@gmail.com', subject: expect.stringContaining('SIN STOCK') })]);
+  });
+
+  it('checks before paying: amount, sold out, expired', async () => {
+    await paypalOrder(2, 1);
+    const check = (id: number, phone = '4125551234') => call(`/api/orders/${id}/paypal/check`, json({ phone }));
+    expect(await (await check(1)).json()).toEqual({ total: 80 });
+    expect((await check(1, '000000')).status).toBe(404);
+    await client.exec('UPDATE products SET stock = 0 WHERE id = 2');
+    expect((await check(1)).status).toBe(409);
+    await client.exec("UPDATE products SET stock = 2 WHERE id = 2; UPDATE orders SET created_at = now() - interval '25 hours'");
+    expect((await check(1)).status).toBe(409);
   });
 
   it('rejects a wrong phone, a bad id, and orders that do not wait for PayPal', async () => {
-    await call('/api/orders', json({ ...customer, phone: '412-555-1234', paymentMethod: 'paypal', items: [{ productId: 1, quantity: 1 }] }));
+    await paypalOrder();
     await call('/api/orders', json({ ...customer, phone: '412-555-1234', items: [{ productId: 1, quantity: 1 }] }));
     expect((await report(1, { phone: '999' })).status).toBe(404);
-    expect((await report(9, {})).status).toBe(404);
+    expect((await report(9)).status).toBe(404);
     expect((await report(1, { captureId: 'abc; drop' })).status).toBe(400);
-    expect((await report(2, {})).status).toBe(409);
+    expect((await report(2)).status).toBe(409);
     await call('/api/orders/1/status', { method: 'PATCH', body: JSON.stringify({ status: 'cancelled' }) }, true);
-    expect((await report(1, {})).status).toBe(409);
+    expect((await report(1)).status).toBe(409);
+  });
+
+  it('cancels PayPal orders unpaid after 24 hours and tells the customer', async () => {
+    const { expireUnpaidPaypalOrders } = await import('../src/routes/orders');
+    await paypalOrder(); // 1: old, unpaid -> cancelled
+    await paypalOrder(); // 2: recent -> stays
+    await call('/api/orders', json({ ...customer, items: [{ productId: 1, quantity: 1 }] })); // 3: transfer -> stays
+    await paypalOrder(); // 4: old but paid -> stays
+    await report(4);
+    await client.exec("UPDATE orders SET created_at = now() - interval '25 hours' WHERE id IN (1, 3, 4)");
+    sentMails.length = 0;
+    expect(await expireUnpaidPaypalOrders(testDb as never, {})).toBe(1);
+    const statuses = Object.fromEntries((await orderList()).map((o) => [o.id, o.status]));
+    expect(statuses).toEqual({ 1: 'cancelled', 2: 'pending', 3: 'pending', 4: 'review' });
+    expect(sentMails).toEqual([expect.objectContaining({ to: 'ana@cliente.test', subject: expect.stringContaining('cancelado') })]);
+  });
+});
+
+describe('order emails', () => {
+  it('requires a valid email and notifies the customer and the store', async () => {
+    const bad = await call('/api/orders', json({ ...customer, email: 'no-es-correo', items: [{ productId: 1, quantity: 1 }] }));
+    expect(bad.status).toBe(400);
+    const { email: _omit, ...withoutEmail } = customer;
+    expect((await call('/api/orders', json({ ...withoutEmail, items: [{ productId: 1, quantity: 1 }] }))).status).toBe(400);
+    expect(sentMails).toEqual([]);
+
+    await call('/api/orders', json({ ...customer, items: [{ productId: 1, quantity: 1 }] }));
+    expect(sentMails.map((m) => m.to).sort()).toEqual(['alexandrajewelry2@gmail.com', 'ana@cliente.test']);
+
+    sentMails.length = 0;
+    const patch = (status: string) => call('/api/orders/1/status', { method: 'PATCH', body: JSON.stringify({ status }) }, true);
+    await patch('confirmed');
+    await patch('pending'); // no email going back
+    await patch('shipped');
+    expect(sentMails.map((m) => m.subject)).toEqual([
+      expect.stringContaining('Confirmamos tu pedido'),
+      expect.stringContaining('va en camino'),
+    ]);
+  });
+});
+
+describe('contact messages', () => {
+  it('saves the message, emails the store and manages the inbox', async () => {
+    const msg = { name: 'Luisa', email: 'luisa@test.dev', phone: '', message: 'Hola, ¿tienen tallas?' };
+    expect((await call('/api/contact', json({ ...msg, email: 'mal' }))).status).toBe(400);
+    expect((await call('/api/contact', json(msg))).status).toBe(201);
+    expect(sentMails).toEqual([expect.objectContaining({ to: 'alexandrajewelry2@gmail.com' })]);
+
+    expect((await call('/api/contact')).status).toBe(401);
+    const inbox = (await (await call('/api/contact', {}, true)).json()) as Array<Record<string, unknown>>;
+    expect(inbox).toEqual([expect.objectContaining({ id: 1, name: 'Luisa', read: false })]);
+    expect(await (await call('/api/contact/unread-count', {}, true)).json()).toEqual({ count: 1 });
+
+    await call('/api/contact/1/read', { method: 'PATCH', body: JSON.stringify({ read: true }) }, true);
+    expect(await (await call('/api/contact/unread-count', {}, true)).json()).toEqual({ count: 0 });
+    expect((await call('/api/contact/1', { method: 'DELETE' }, true)).status).toBe(200);
+    expect((await call('/api/contact/1', { method: 'DELETE' }, true)).status).toBe(404);
+  });
+});
+
+describe('email settings', () => {
+  const put = (body: unknown, auth = true) => call('/api/settings/mail', { method: 'PUT', body: JSON.stringify(body) }, auth);
+
+  it('stores the account with the password encrypted and never returns it', async () => {
+    expect((await call('/api/settings/mail')).status).toBe(401);
+    const empty = await (await call('/api/settings/mail', {}, true)).json();
+    expect(empty).toMatchObject({ user: '', hasPassword: false, source: 'none' });
+
+    expect((await put({ user: 'no-es-correo', password: 'x' })).status).toBe(400);
+    expect((await put({ user: 'avisos@gmail.com' })).status).toBe(400); // no password yet
+    expect((await put({ user: 'avisos@gmail.com', password: 'abcd efgh ijkl mnop' })).status).toBe(200);
+
+    const raw = (await client.query<{ value: Record<string, unknown> }>("SELECT value FROM settings WHERE key = 'smtp'")).rows[0].value;
+    expect(JSON.stringify(raw)).not.toContain('abcdefghijklmnop');
+    expect(raw).toMatchObject({ user: 'avisos@gmail.com', host: 'smtp.gmail.com', port: 465 });
+
+    const saved = await (await call('/api/settings/mail', {}, true)).json();
+    expect(saved).toMatchObject({ user: 'avisos@gmail.com', hasPassword: true, source: 'panel', updatedBy: 'ana' });
+    expect(JSON.stringify(saved)).not.toContain('abcdefghijklmnop');
+
+    // Changing only the account keeps the saved password
+    expect((await put({ user: 'otra@gmail.com' })).status).toBe(200);
+    expect(await (await call('/api/settings/mail', {}, true)).json()).toMatchObject({ user: 'otra@gmail.com', hasPassword: true });
+  });
+
+  it('sends a test email with the saved account and explains failures', async () => {
+    expect((await call('/api/settings/mail/test', json({}), true)).status).toBe(400); // nothing saved
+    await put({ user: 'avisos@gmail.com', password: 'abcd efgh ijkl mnop' });
+    const ok = await call('/api/settings/mail/test', json({ to: 'yo@test.dev' }), true);
+    expect(await ok.json()).toEqual({ ok: true, to: 'yo@test.dev' });
+    expect(sentMails).toEqual([expect.objectContaining({ to: 'yo@test.dev', subject: expect.stringContaining('via avisos@gmail.com') })]);
+
+    await put({ user: 'avisos@gmail.com', password: 'equivocada' });
+    const bad = await call('/api/settings/mail/test', json({}), true);
+    expect(bad.status).toBe(502);
+    expect(((await bad.json()) as { error: string }).error).toContain('contraseña de aplicación');
+  });
+
+  it('is for administrators only', async () => {
+    const seller = await new SignJWT({ sub: '2', role: 'vendedor', username: 'leo' })
+      .setProtectedHeader({ alg: 'HS256' })
+      .setExpirationTime('1h')
+      .sign(new TextEncoder().encode(JWT_SECRET));
+    const res = await app.request('/api/settings/mail', { headers: { Authorization: `Bearer ${seller}` } }, env());
+    expect(res.status).toBe(403);
   });
 });

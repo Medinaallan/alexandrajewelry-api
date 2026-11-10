@@ -6,7 +6,11 @@ import { products } from './routes/products';
 import { categories } from './routes/categories';
 import { subcategories } from './routes/subcategories';
 import { testimonials, adminTestimonials } from './routes/testimonials';
-import { orders } from './routes/orders';
+import { orders, expireUnpaidPaypalOrders } from './routes/orders';
+import { contact } from './routes/contact';
+import { settings } from './routes/settings';
+import { getDb } from './db';
+import type { MailEnv } from './mail';
 import { users } from './routes/users';
 import { images } from './routes/images';
 import { stock } from './routes/stock';
@@ -17,7 +21,7 @@ type Bindings = {
   ADMIN_PASSWORD: string;
   JWT_SECRET: string;
   ALLOWED_ORIGINS: string;
-};
+} & MailEnv;
 
 const app = new Hono<{ Bindings: Bindings }>();
 
@@ -45,6 +49,8 @@ app.route('/api/users', users);
 app.route('/api/images', images);
 app.route('/api/stock', stock);
 app.route('/api/sales', sales);
+app.route('/api/contact', contact);
+app.route('/api/settings', settings);
 
 app.get('/', (c) => c.json({ status: 'ok', service: 'Alexandra Jewelry API v2' }));
 
@@ -68,4 +74,16 @@ app.onError((err, c) => {
   return c.json({ error: 'Internal server error' }, 500);
 });
 
-export default app;
+export { app };
+
+export default {
+  fetch: app.fetch,
+  // Hourly cron (wrangler.toml): cancels PayPal orders unpaid after 24 hours
+  async scheduled(_event: ScheduledController, env: Bindings, ctx: ExecutionContext) {
+    ctx.waitUntil(
+      expireUnpaidPaypalOrders(getDb(env.DATABASE_URL), env).then((n) => {
+        if (n > 0) console.log(`Cancelled ${n} unpaid PayPal order(s)`);
+      }),
+    );
+  },
+};

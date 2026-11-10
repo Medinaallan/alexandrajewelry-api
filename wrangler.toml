@@ -6,6 +6,15 @@ compatibility_flags = ["nodejs_compat"]
 [vars]
 ALLOWED_ORIGINS = "https://alexandrajewelry.vercel.app"
 R2_PUBLIC_URL = "https://pub-1752cd9998ba43e1a1623e0b96e7d47c.r2.dev"
+# Store inbox for new orders and contact messages, and the public site
+STORE_EMAIL = "alexandrajewelry2@gmail.com"
+SITE_URL = "https://alexandrajewelry.vercel.app"
+SMTP_HOST = "smtp.gmail.com"
+SMTP_PORT = "465"
+
+# Hourly: cancels PayPal orders still unpaid 24 hours after being placed
+[triggers]
+crons = ["0 * * * *"]
 
 [[r2_buckets]]
 binding = "IMAGES"
@@ -29,4 +38,8 @@ simple = { limit = 10, period = 60 }
 #   DATABASE_URL
 #   ADMIN_PASSWORD
 #   JWT_SECRET
+# Optional (fallback): the email account is normally set in the admin panel,
+# Configuracion > Correo, and stored encrypted in the database.
+#   SMTP_USER
+#   SMTP_PASS
  
