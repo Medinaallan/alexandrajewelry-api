@@ -34,6 +34,7 @@ beforeEach(async () => {
       id serial PRIMARY KEY,
       name text NOT NULL,
       price numeric(12, 2) NOT NULL,
+      cost numeric(12, 2),
       stock integer NOT NULL DEFAULT 0,
       updated_at timestamp DEFAULT now() NOT NULL
     );
@@ -43,6 +44,7 @@ beforeEach(async () => {
       product_name text NOT NULL,
       quantity integer NOT NULL,
       unit_price numeric(12, 2) NOT NULL,
+      unit_cost numeric(12, 2),
       total numeric(12, 2) NOT NULL,
       notes text DEFAULT '' NOT NULL,
       sold_by text DEFAULT '' NOT NULL,

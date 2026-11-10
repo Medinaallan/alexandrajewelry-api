@@ -5,7 +5,7 @@ import { productsTable, productImagesTable, categoriesTable, subcategoriesTable,
 import { requireAuth } from '../middleware/auth';
 import { parseFields, parseId } from '../utils/validate';
 
-type Bindings = { DATABASE_URL: string; JWT_SECRET: string };
+type Bindings = { DATABASE_URL: string; JWT_SECRET: string; IMAGES: R2Bucket; R2_PUBLIC_URL: string };
 
 const products = new Hono<{ Bindings: Bindings }>();
 
@@ -246,7 +246,22 @@ products.delete('/:id', requireAuth, async (c) => {
       error: 'Este producto tiene ventas o movimientos de stock registrados, por eso no se puede borrar. Desactívalo para ocultarlo de la tienda.',
     }, 409);
   }
-  await db.delete(productsTable).where(eq(productsTable.id, id));
+  const images = await db
+    .select({ data: productImagesTable.data })
+    .from(productImagesTable)
+    .where(eq(productImagesTable.productId, id));
+  await db.delete(productsTable).where(eq(productsTable.id, id)); // image rows go with it (cascade)
+
+  // Their files in R2 too; a failure here only leaves an unused file behind
+  const prefix = `${c.env.R2_PUBLIC_URL}/`;
+  const keys = images.map((i) => i.data ?? '').filter((d) => c.env.R2_PUBLIC_URL && d.startsWith(prefix)).map((d) => d.slice(prefix.length));
+  if (keys.length) {
+    try {
+      await c.env.IMAGES.delete(keys);
+    } catch (err) {
+      console.error('Could not delete product images from R2', id, err);
+    }
+  }
   return c.json({ success: true });
 });
 

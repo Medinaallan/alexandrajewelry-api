@@ -17,6 +17,8 @@ export type SaleRow = {
   productName: string;
   quantity: number;
   unitPrice: number;
+  /** Product cost when sold (null if the product had no cost) */
+  unitCost: number | null;
   total: number;
   notes: string;
   soldBy: string;
@@ -109,14 +111,15 @@ export async function registerSales(
         SET stock = p.stock - l.quantity, updated_at = now()
         FROM lines l
         WHERE p.id = l.product_id AND p.stock >= l.quantity AND EXISTS (SELECT 1 FROM ord)
-        RETURNING p.id, p.name, p.price
+        RETURNING p.id, p.name, p.price, p.cost
       )
-      INSERT INTO sales (product_id, product_name, quantity, unit_price, total, notes, sold_by, order_id)
+      INSERT INTO sales (product_id, product_name, quantity, unit_price, unit_cost, total, notes, sold_by, order_id)
       SELECT
         l.product_id,
         COALESCE(u.name, ''),
         l.quantity / (CASE WHEN (SELECT count(*) FROM upd) = (SELECT count(*) FROM lines) THEN 1 ELSE 0 END),
         COALESCE(l.unit_price, u.price::numeric, 0),
+        u.cost,
         round(COALESCE(l.unit_price, u.price::numeric, 0) * l.quantity, 2),
         l.notes,
         ${soldBy}::text,
@@ -134,6 +137,7 @@ export async function registerSales(
       productName: String(r.product_name),
       quantity: Number(r.quantity),
       unitPrice: Number(r.unit_price),
+      unitCost: r.unit_cost == null ? null : Number(r.unit_cost),
       total: Number(r.total),
       notes: String(r.notes),
       soldBy: String(r.sold_by),

@@ -22,8 +22,53 @@ type Variables = { username: string };
 
 const settings = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 
-// Store settings are for administrators only
-settings.use('*', requireAuth, requireAdmin);
+// ─── Public: what the checkout needs (no secrets) ────────────────────────────
+
+/** What the `settings` row with key "paypal" holds. The Client ID is public. */
+export type PaypalSettings = { enabled: boolean; clientId: string };
+export const PAYPAL_SETTINGS_KEY = 'paypal';
+const PAYPAL_CLIENT_ID = /^[A-Za-z0-9_-]{20,128}$/;
+
+/** PayPal as set in the panel, or null if it was never set (the site then uses its build setting). */
+export async function readPaypalSettings(databaseUrl: string): Promise<PaypalSettings | null> {
+  const [row] = await getDb(databaseUrl).select().from(settingsTable).where(eq(settingsTable.key, PAYPAL_SETTINGS_KEY));
+  return (row?.value as PaypalSettings | undefined) ?? null;
+}
+
+settings.get('/public/payments', async (c) => {
+  const paypal = await readPaypalSettings(c.env.DATABASE_URL);
+  c.header('Cache-Control', 'public, max-age=60');
+  return c.json({ paypal: paypal ? { configured: true, enabled: paypal.enabled, clientId: paypal.clientId } : { configured: false } });
+});
+
+// ─── Admin ───────────────────────────────────────────────────────────────────
+
+// Everything else is for administrators only
+settings.use('/mail', requireAuth, requireAdmin);
+settings.use('/mail/*', requireAuth, requireAdmin);
+settings.use('/paypal', requireAuth, requireAdmin);
+
+settings.get('/paypal', async (c) => {
+  const paypal = await readPaypalSettings(c.env.DATABASE_URL);
+  return c.json({ configured: paypal !== null, enabled: paypal?.enabled ?? false, clientId: paypal?.clientId ?? '' });
+});
+
+settings.put('/paypal', async (c) => {
+  const body = await c.req.json<{ enabled?: unknown; clientId?: unknown }>();
+  if (typeof body.enabled !== 'boolean') return c.json({ error: 'Invalid request' }, 400);
+  const clientId = typeof body.clientId === 'string' ? body.clientId.trim() : '';
+  if (body.enabled && !PAYPAL_CLIENT_ID.test(clientId)) {
+    return c.json({ error: 'Pega el Client ID completo de PayPal (letras, números, guiones; sin espacios).' }, 400);
+  }
+  if (clientId && !PAYPAL_CLIENT_ID.test(clientId)) return c.json({ error: 'El Client ID no es válido.' }, 400);
+  const value: PaypalSettings = { enabled: body.enabled, clientId };
+  const updatedBy = c.get('username') ?? '';
+  await getDb(c.env.DATABASE_URL)
+    .insert(settingsTable)
+    .values({ key: PAYPAL_SETTINGS_KEY, value, updatedBy })
+    .onConflictDoUpdate({ target: settingsTable.key, set: { value, updatedBy, updatedAt: new Date() } });
+  return c.json({ ok: true });
+});
 
 async function readStored(c: { env: Bindings }): Promise<{ stored: StoredSmtp | null; updatedAt: Date | null; updatedBy: string }> {
   const [row] = await getDb(c.env.DATABASE_URL).select().from(settingsTable).where(eq(settingsTable.key, SMTP_SETTINGS_KEY));

@@ -25,8 +25,22 @@ export const usersTable = pgTable('users', {
   passwordHash: text('password_hash').notNull(),
   role: text('role').notNull().default('admin'), // prepared for future roles
   active: boolean('active').notNull().default(true),
+  // Goes up when the password changes or the user is turned off: every
+  // session (token) issued before stops working.
+  tokenVersion: integer('token_version').notNull().default(0),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
+});
+
+// One-time links to set a new password, sent by email. Only a hash of the
+// token is stored.
+export const passwordResetsTable = pgTable('password_resets', {
+  id: serial('id').primaryKey(),
+  userId: integer('user_id').notNull().references(() => usersTable.id, { onDelete: 'cascade' }),
+  tokenHash: text('token_hash').notNull().unique(),
+  expiresAt: timestamp('expires_at').notNull(),
+  usedAt: timestamp('used_at'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
 // ─── Categories ───────────────────────────────────────────────────────────────
@@ -126,6 +140,8 @@ export const salesTable = pgTable('sales', {
   productName: text('product_name').notNull(),
   quantity: integer('quantity').notNull(),
   unitPrice: money('unit_price').notNull(),
+  // Product cost when it was sold, so later cost changes don't rewrite past profit
+  unitCost: money('unit_cost'),
   total: money('total').notNull(),
   notes: text('notes').notNull().default(''),
   soldBy: text('sold_by').notNull().default(''),
@@ -153,6 +169,10 @@ export const ordersTable = pgTable('orders', {
   // Not verified with PayPal: the admin checks it before marking the order paid.
   paymentRef: text('payment_ref'),
   paymentAmount: money('payment_amount'),
+  // web: placed by the customer · manual: entered in the panel (WhatsApp, Instagram, store)
+  source: text('source').notNull().default('web'),
+  // Only the store sees these
+  adminNotes: text('admin_notes').notNull().default(''),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 

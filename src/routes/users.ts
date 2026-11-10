@@ -1,5 +1,5 @@
 import { Hono } from 'hono';
-import { and, eq, ne } from 'drizzle-orm';
+import { and, eq, ne, sql } from 'drizzle-orm';
 import { getDb } from '../db';
 import { usersTable } from '../db/schema';
 import { requireAuth, requireAdmin } from '../middleware/auth';
@@ -107,7 +107,7 @@ users.patch('/:id/password', async (c) => {
   const passwordHash = await hashPassword(password);
   const [row] = await db
     .update(usersTable)
-    .set({ passwordHash, updatedAt: new Date() })
+    .set({ passwordHash, tokenVersion: sql`${usersTable.tokenVersion} + 1`, updatedAt: new Date() })
     .where(eq(usersTable.id, id))
     .returning({ id: usersTable.id });
   if (!row) return c.json({ error: 'Not found' }, 404);
@@ -131,7 +131,7 @@ users.patch('/:id/toggle', async (c) => {
   }
   const [row] = await db
     .update(usersTable)
-    .set({ active: !current.active, updatedAt: new Date() })
+    .set({ active: !current.active, tokenVersion: sql`${usersTable.tokenVersion} + 1`, updatedAt: new Date() })
     .where(eq(usersTable.id, id))
     .returning({ id: usersTable.id, active: usersTable.active });
   return c.json(row);

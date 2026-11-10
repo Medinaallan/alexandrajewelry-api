@@ -11,6 +11,7 @@ import {
   OrderChangedError,
 } from '../db/inventory';
 import { rateLimit } from '../middleware/rateLimit';
+import { readPaypalSettings } from './settings';
 import { parseFields, parseId, toMoney } from '../utils/validate';
 import {
   executionCtx,
@@ -29,6 +30,8 @@ type Bindings = { DATABASE_URL: string; JWT_SECRET: string; IMAGES: R2Bucket } &
 type Variables = { username: string };
 
 const PAYMENT_METHODS = ['transfer', 'googlepay', 'paypal', 'whatsapp'];
+// Orders entered in the panel can also be paid in cash at the store
+const MANUAL_PAYMENT_METHODS = ['transfer', 'paypal', 'whatsapp', 'cash'];
 // `review`: the customer reported a PayPal payment the admin has not checked yet.
 const ORDER_STATUSES = ['pending', 'confirmed', 'review', 'paid', 'shipped', 'delivered', 'cancelled'];
 // In these statuses the order's units are out of stock and counted as sales.
@@ -101,7 +104,6 @@ function canPayWithPaypal(row: OrderRow, now = Date.now()): boolean {
  * Run by the hourly cron. No stock to return: unpaid orders never took any.
  */
 export async function expireUnpaidPaypalOrders(db: Db, env: MailEnv): Promise<number> {
-  const cutoff = new Date(Date.now() - PAYPAL_HOLD_MS);
   const expired = await db
     .update(ordersTable)
     .set({ status: 'cancelled' })
@@ -110,7 +112,8 @@ export async function expireUnpaidPaypalOrders(db: Db, env: MailEnv): Promise<nu
         eq(ordersTable.paymentMethod, 'paypal'),
         inArray(ordersTable.status, ['pending', 'confirmed']),
         isNull(ordersTable.paymentRef),
-        lt(ordersTable.createdAt, cutoff),
+        // Compared in the database's own clock (created_at is set by it)
+        lt(ordersTable.createdAt, sql`now() - make_interval(secs => ${PAYPAL_HOLD_MS / 1000})`),
       ),
     )
     .returning();
@@ -121,6 +124,90 @@ export async function expireUnpaidPaypalOrders(db: Db, env: MailEnv): Promise<nu
     }),
   );
   return expired.length;
+}
+
+type PricedItem = { productId: number; code: string; name: string; price: number; quantity: number; subtotal: number };
+type Priced = { ok: true; items: PricedItem[]; total: number } | { ok: false; status: 400 | 409; error: string };
+
+/**
+ * Turns [{productId, quantity}] into order lines with the current prices from
+ * the database (never the client's). Products must be on sale and in stock;
+ * stock is only checked here, it is taken when the order is marked paid.
+ */
+async function priceItems(db: Db, rawItems: unknown): Promise<Priced> {
+  if (!Array.isArray(rawItems) || rawItems.length === 0 || rawItems.length > MAX_ITEMS) {
+    return { ok: false, status: 400, error: 'El pedido no tiene productos.' };
+  }
+  const quantities = new Map<number, number>();
+  for (const raw of rawItems) {
+    const item = parseFields(raw, itemSpec, ['productId', 'quantity']);
+    if (!item.ok) return { ok: false, status: 400, error: item.error };
+    const { productId, quantity } = item.data;
+    quantities.set(productId, (quantities.get(productId) ?? 0) + quantity);
+  }
+  const products = await db
+    .select({
+      id: productsTable.id,
+      code: productsTable.code,
+      name: productsTable.name,
+      price: productsTable.price,
+      stock: productsTable.stock,
+      active: productsTable.active,
+    })
+    .from(productsTable)
+    .where(inArray(productsTable.id, [...quantities.keys()]));
+
+  const items: PricedItem[] = [];
+  for (const [productId, quantity] of quantities) {
+    const product = products.find((p) => p.id === productId);
+    if (!product || !product.active) {
+      return { ok: false, status: 409, error: 'Uno de los productos de tu carrito ya no está disponible.' };
+    }
+    if (product.stock < quantity) {
+      return {
+        ok: false,
+        status: 409,
+        error: product.stock === 0
+          ? `"${product.name}" está agotado. Quítalo del carrito para continuar.`
+          : `Solo quedan ${product.stock} unidades de "${product.name}". Ajusta la cantidad para continuar.`,
+      };
+    }
+    items.push({ productId, code: product.code, name: product.name, price: product.price, quantity, subtotal: toMoney(product.price * quantity) });
+  }
+  return { ok: true, items, total: toMoney(items.reduce((sum, item) => sum + item.subtotal, 0)) };
+}
+
+// Customer data an admin types in (manual orders and edits): only name and phone are required
+const adminOrderSpec = {
+  name: { type: 'string', min: 1, max: 120 },
+  phone: { type: 'string', min: 1, max: 40 },
+  email: { type: 'string', max: 200 },
+  address: { type: 'string', max: 300 },
+  city: { type: 'string', max: 120 },
+  notes: { type: 'string', max: 1000 },
+  paymentMethod: { type: 'string', min: 1, max: 20 },
+} as const;
+
+/** Validates the customer part of an admin order; returns the DB fields or an error. */
+function parseAdminCustomer(payload: unknown) {
+  const parsed = parseFields(payload, adminOrderSpec, ['name', 'phone', 'paymentMethod']);
+  if (!parsed.ok) return { ok: false as const, error: parsed.error };
+  const d = parsed.data;
+  if (!MANUAL_PAYMENT_METHODS.includes(d.paymentMethod)) return { ok: false as const, error: 'Forma de pago no válida.' };
+  const email = (d.email ?? '').trim();
+  if (email && !isEmail(email)) return { ok: false as const, error: 'El correo del cliente no es válido.' };
+  return {
+    ok: true as const,
+    fields: {
+      customerName: d.name.trim(),
+      customerPhone: d.phone.trim(),
+      customerEmail: email,
+      customerAddress: (d.address ?? '').trim(),
+      customerCity: (d.city ?? '').trim(),
+      notes: d.notes ?? '',
+      paymentMethod: d.paymentMethod,
+    },
+  };
 }
 
 const orders = new Hono<{ Bindings: Bindings; Variables: Variables }>();
@@ -166,17 +253,9 @@ orders.post('/', rateLimit('PUBLIC_LIMITER'), async (c) => {
   const order = parsed.data;
   if (!PAYMENT_METHODS.includes(order.paymentMethod)) return c.json({ error: 'Invalid payment method' }, 400);
   if (!isEmail(order.email)) return c.json({ error: 'Escribe un correo electrónico válido.' }, 400);
-
-  const rawItems = (payload as { items?: unknown }).items;
-  if (!Array.isArray(rawItems) || rawItems.length === 0 || rawItems.length > MAX_ITEMS) {
-    return c.json({ error: 'El pedido no tiene productos.' }, 400);
-  }
-  const quantities = new Map<number, number>();
-  for (const raw of rawItems) {
-    const item = parseFields(raw, itemSpec, ['productId', 'quantity']);
-    if (!item.ok) return c.json({ error: item.error }, 400);
-    const { productId, quantity } = item.data;
-    quantities.set(productId, (quantities.get(productId) ?? 0) + quantity);
+  if (order.paymentMethod === 'paypal') {
+    const paypal = await readPaypalSettings(c.env.DATABASE_URL);
+    if (paypal && !paypal.enabled) return c.json({ error: 'El pago con PayPal no está disponible. Elige otra forma de pago.' }, 400);
   }
 
   if (receipt) {
@@ -185,42 +264,9 @@ orders.post('/', rateLimit('PUBLIC_LIMITER'), async (c) => {
   }
 
   const db = getDb(c.env.DATABASE_URL);
-  const products = await db
-    .select({
-      id: productsTable.id,
-      code: productsTable.code,
-      name: productsTable.name,
-      price: productsTable.price,
-      stock: productsTable.stock,
-      active: productsTable.active,
-    })
-    .from(productsTable)
-    .where(inArray(productsTable.id, [...quantities.keys()]));
-
-  const items = [];
-  for (const [productId, quantity] of quantities) {
-    const product = products.find((p) => p.id === productId);
-    if (!product || !product.active) {
-      return c.json({ error: 'Uno de los productos de tu carrito ya no está disponible.' }, 409);
-    }
-    // Stock is only checked here; it is taken when the order is marked paid.
-    if (product.stock < quantity) {
-      return c.json({
-        error: product.stock === 0
-          ? `"${product.name}" está agotado. Quítalo del carrito para continuar.`
-          : `Solo quedan ${product.stock} unidades de "${product.name}". Ajusta la cantidad para continuar.`,
-      }, 409);
-    }
-    items.push({
-      productId,
-      code: product.code,
-      name: product.name,
-      price: product.price,
-      quantity,
-      subtotal: toMoney(product.price * quantity),
-    });
-  }
-  const total = toMoney(items.reduce((sum, item) => sum + item.subtotal, 0));
+  const priced = await priceItems(db, (payload as { items?: unknown }).items);
+  if (!priced.ok) return c.json({ error: priced.error }, priced.status);
+  const { items, total } = priced;
 
   const [row] = await db
     .insert(ordersTable)
@@ -260,6 +306,94 @@ orders.post('/', rateLimit('PUBLIC_LIMITER'), async (c) => {
 
 /** "+58 (412) 555-1234" → "584125551234" */
 const phoneDigits = (phone: string) => phone.replace(/\D/g, '');
+
+// Admin: an order taken outside the website (WhatsApp, Instagram, the store).
+// Same prices and stock check as the checkout. The customer gets the usual
+// email if one is given; the store isn't notified (it typed it in).
+orders.post('/manual', requireAuth, async (c) => {
+  const payload = await c.req.json<unknown>();
+  const customer = parseAdminCustomer(payload);
+  if (!customer.ok) return c.json({ error: customer.error }, 400);
+  const db = getDb(c.env.DATABASE_URL);
+  const priced = await priceItems(db, (payload as { items?: unknown }).items);
+  if (!priced.ok) return c.json({ error: priced.error }, priced.status);
+
+  const [row] = await db
+    .insert(ordersTable)
+    .values({ ...customer.fields, items: priced.items, total: priced.total, source: 'manual' })
+    .returning();
+  if (row.customerEmail) await inBackground(executionCtx(c), sendMail(c.env, orderReceivedMail(c.env, toMailOrder(row))));
+  return c.json(row, 201);
+});
+
+// Admin: change the customer data and products of an order that hasn't taken
+// stock yet (pending / confirmed, no PayPal payment). Prices are re-read.
+orders.put('/:id', requireAuth, async (c) => {
+  const id = parseId(c.req.param('id'));
+  if (!id) return c.json({ error: 'Not found' }, 404);
+  const payload = await c.req.json<unknown>();
+  const customer = parseAdminCustomer(payload);
+  if (!customer.ok) return c.json({ error: customer.error }, 400);
+  const db = getDb(c.env.DATABASE_URL);
+  const [current] = await db.select().from(ordersTable).where(eq(ordersTable.id, id));
+  if (!current) return c.json({ error: 'Not found' }, 404);
+  if (!['pending', 'confirmed'].includes(current.status) || current.paymentRef) {
+    return c.json({ error: 'Solo se pueden editar pedidos Pendientes o Confirmados sin pago registrado.' }, 409);
+  }
+  const priced = await priceItems(db, (payload as { items?: unknown }).items);
+  if (!priced.ok) return c.json({ error: priced.error }, priced.status);
+
+  // Only if nobody changed its status meanwhile
+  const [row] = await db
+    .update(ordersTable)
+    .set({ ...customer.fields, items: priced.items, total: priced.total })
+    .where(and(eq(ordersTable.id, id), eq(ordersTable.status, current.status), isNull(ordersTable.paymentRef)))
+    .returning();
+  if (!row) return c.json({ error: 'Otra persona cambió este pedido. Recarga la página.' }, 409);
+  return c.json(row);
+});
+
+// Admin: internal note on the order (any status; the customer never sees it)
+orders.patch('/:id/notes', requireAuth, async (c) => {
+  const id = parseId(c.req.param('id'));
+  const { adminNotes } = await c.req.json<{ adminNotes?: unknown }>();
+  if (!id || typeof adminNotes !== 'string' || adminNotes.length > 2000) return c.json({ error: 'Invalid request' }, 400);
+  const db = getDb(c.env.DATABASE_URL);
+  const [row] = await db.update(ordersTable).set({ adminNotes }).where(eq(ordersTable.id, id)).returning();
+  return row ? c.json(row) : c.json({ error: 'Not found' }, 404);
+});
+
+// Statuses where the customer actually bought (for "total spent")
+const BOUGHT = new Set(['review', 'paid', 'shipped', 'delivered']);
+
+// Admin: customers built from the orders, grouped by phone number
+orders.get('/customers', requireAuth, async (c) => {
+  const db = getDb(c.env.DATABASE_URL);
+  const rows = await db.select().from(ordersTable).orderBy(desc(ordersTable.createdAt));
+  type Customer = {
+    key: string; name: string; phone: string; email: string; city: string;
+    orders: number; openOrders: number; spent: number; lastOrderAt: Date; firstOrderAt: Date; orderIds: number[];
+  };
+  const byKey = new Map<string, Customer>();
+  for (const o of rows) {
+    // Same phone = same customer (the last 10 digits, so "+1" doesn't split them)
+    const key = phoneDigits(o.customerPhone).slice(-10) || o.customerEmail.toLowerCase() || `#${o.id}`;
+    let cu = byKey.get(key);
+    if (!cu) {
+      // Rows come newest first: the first one seen has the latest details
+      cu = { key, name: o.customerName, phone: o.customerPhone, email: o.customerEmail, city: o.customerCity,
+        orders: 0, openOrders: 0, spent: 0, lastOrderAt: o.createdAt, firstOrderAt: o.createdAt, orderIds: [] };
+      byKey.set(key, cu);
+    }
+    if (!cu.email && o.customerEmail) cu.email = o.customerEmail;
+    cu.orders += 1;
+    cu.orderIds.push(o.id);
+    if (['pending', 'confirmed', 'review'].includes(o.status)) cu.openOrders += 1;
+    if (BOUGHT.has(o.status)) cu.spent = toMoney(cu.spent + o.total);
+    cu.firstOrderAt = o.createdAt;
+  }
+  return c.json([...byKey.values()].sort((a, b) => b.lastOrderAt.getTime() - a.lastOrderAt.getTime()));
+});
 
 // Public: a customer checks their order with its number and their phone.
 // A wrong phone answers exactly like a missing order, so order numbers

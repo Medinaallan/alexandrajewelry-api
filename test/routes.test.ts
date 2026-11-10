@@ -51,8 +51,9 @@ function fakeBucket() {
       const found = objects.get(key);
       return found ? { body: found.bytes, httpMetadata: { contentType: found.contentType } } : null;
     },
-    async delete(key: string) {
-      objects.delete(key);
+    // Like R2: one key or a list of keys
+    async delete(keys: string | string[]) {
+      for (const key of Array.isArray(keys) ? keys : [keys]) objects.delete(key);
     },
   };
 }
@@ -93,7 +94,7 @@ beforeEach(async () => {
   bucket = fakeBucket();
   sentMails.length = 0;
   await client.exec(`
-    TRUNCATE settings, contact_messages, orders, sales, stock_products, product_images, products, subcategories, categories, users RESTART IDENTITY CASCADE;
+    TRUNCATE password_resets, settings, contact_messages, orders, sales, stock_products, product_images, products, subcategories, categories, users RESTART IDENTITY CASCADE;
     INSERT INTO users (username, email, password_hash) VALUES ('ana', 'ana@test.dev', 'x');
     INSERT INTO categories (name, name_en, slug) VALUES ('Anillos', 'Rings', 'anillos');
     INSERT INTO subcategories (category_id, name, name_en, slug) VALUES (1, 'Oro', 'Gold', 'oro');
@@ -462,6 +463,7 @@ describe('users', () => {
   });
 
   it('blocks tokens without the admin role', async () => {
+    await client.exec("INSERT INTO users (username, email, password_hash, role) VALUES ('bob', 'bob@test.dev', 'x', 'staff')");
     const staff = await new SignJWT({ sub: '2', role: 'staff', username: 'bob' })
       .setProtectedHeader({ alg: 'HS256' })
       .setExpirationTime('1h')
@@ -631,11 +633,187 @@ describe('email settings', () => {
   });
 
   it('is for administrators only', async () => {
+    await client.exec("INSERT INTO users (username, email, password_hash, role) VALUES ('leo', 'leo@test.dev', 'x', 'vendedor')");
     const seller = await new SignJWT({ sub: '2', role: 'vendedor', username: 'leo' })
       .setProtectedHeader({ alg: 'HS256' })
       .setExpirationTime('1h')
       .sign(new TextEncoder().encode(JWT_SECRET));
     const res = await app.request('/api/settings/mail', { headers: { Authorization: `Bearer ${seller}` } }, env());
     expect(res.status).toBe(403);
+  });
+});
+
+describe('PayPal settings', () => {
+  const CLIENT_ID = 'BAA5lcZAIHMtX277l4BVwpmdykUt4Q8hYVjydKixc';
+  const put = (body: unknown) => call('/api/settings/paypal', { method: 'PUT', body: JSON.stringify(body) }, true);
+  const publicConfig = async () => (await (await call('/api/settings/public/payments')).json()) as { paypal: Record<string, unknown> };
+
+  it('is not configured until the admin saves it', async () => {
+    expect(await publicConfig()).toEqual({ paypal: { configured: false } });
+    expect((await call('/api/settings/paypal')).status).toBe(401);
+  });
+
+  it('saves the Client ID and publishes it for the checkout', async () => {
+    expect((await put({ enabled: true, clientId: 'corto' })).status).toBe(400);
+    expect((await put({ enabled: true, clientId: CLIENT_ID })).status).toBe(200);
+    expect(await publicConfig()).toEqual({ paypal: { configured: true, enabled: true, clientId: CLIENT_ID } });
+    expect(await (await call('/api/settings/paypal', {}, true)).json()).toEqual({ configured: true, enabled: true, clientId: CLIENT_ID });
+  });
+
+  it('turning PayPal off hides it and rejects PayPal orders', async () => {
+    await put({ enabled: false, clientId: CLIENT_ID });
+    expect((await publicConfig()).paypal).toMatchObject({ enabled: false });
+    const res = await call('/api/orders', json({ ...customer, paymentMethod: 'paypal', items: [{ productId: 1, quantity: 1 }] }));
+    expect(res.status).toBe(400);
+    expect((await call('/api/orders', json({ ...customer, items: [{ productId: 1, quantity: 1 }] }))).status).toBe(201);
+  });
+});
+
+describe('sessions', () => {
+  const sign = (claims: Record<string, unknown>) =>
+    new SignJWT({ sub: '1', role: 'admin', username: 'ana', ...claims })
+      .setProtectedHeader({ alg: 'HS256' })
+      .setExpirationTime('1h')
+      .sign(new TextEncoder().encode(JWT_SECRET));
+  const asToken = (t: string) => app.request('/api/orders', { headers: { Authorization: `Bearer ${t}` } }, env());
+
+  it('ends when the user is turned off or the password changes', async () => {
+    await client.exec("INSERT INTO users (username, email, password_hash) VALUES ('leo', 'leo@test.dev', 'x')");
+    const leo = await new SignJWT({ sub: '2', role: 'admin', username: 'leo', tv: 0 })
+      .setProtectedHeader({ alg: 'HS256' })
+      .setExpirationTime('1h')
+      .sign(new TextEncoder().encode(JWT_SECRET));
+    expect((await asToken(leo)).status).toBe(200);
+
+    await call('/api/users/2/password', { method: 'PATCH', body: JSON.stringify({ password: 'nueva-clave-123' }) }, true);
+    expect((await asToken(leo)).status).toBe(401);
+
+    const leoNew = await new SignJWT({ sub: '2', role: 'admin', username: 'leo', tv: 1 })
+      .setProtectedHeader({ alg: 'HS256' })
+      .setExpirationTime('1h')
+      .sign(new TextEncoder().encode(JWT_SECRET));
+    expect((await asToken(leoNew)).status).toBe(200);
+    await call('/api/users/2/toggle', { method: 'PATCH' }, true);
+    expect((await asToken(leoNew)).status).toBe(401);
+  });
+
+  it('takes the role from the database, not from the token', async () => {
+    await client.exec("UPDATE users SET role = 'vendedor' WHERE id = 1");
+    const res = await app.request('/api/users', { headers: { Authorization: `Bearer ${await sign({ role: 'admin' })}` } }, env());
+    expect(res.status).toBe(403);
+  });
+});
+
+describe('password reset', () => {
+  it('emails a one-time link that sets a new password and ends old sessions', async () => {
+    const { hashPassword } = await import('../src/utils/password');
+    await client.query('UPDATE users SET password_hash = $1 WHERE id = 1', [await hashPassword('vieja-clave-1')]);
+
+    // Same answer whether the user exists or not
+    const unknown = await call('/api/auth/forgot', json({ login: 'nadie@test.dev' }));
+    expect(unknown.status).toBe(200);
+    expect(sentMails).toEqual([]);
+    const known = await call('/api/auth/forgot', json({ login: 'ANA@test.dev' }));
+    expect(await known.json()).toEqual(await unknown.json());
+    expect(sentMails).toEqual([expect.objectContaining({ to: 'ana@test.dev', subject: expect.stringContaining('contraseña') })]);
+
+    // The emailed token is never stored as is: grab it by issuing a known one
+    const { rows } = await client.query<{ token_hash: string }>('SELECT token_hash FROM password_resets');
+    expect(rows).toHaveLength(1);
+    expect(rows[0].token_hash).toMatch(/^[0-9a-f]{64}$/);
+
+    const token = 'a'.repeat(64);
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(token));
+    const hash = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+    await client.query("INSERT INTO password_resets (user_id, token_hash, expires_at) VALUES (1, $1, now() + interval '1 hour')", [hash]);
+
+    expect((await call('/api/auth/reset', json({ token, password: 'corta' }))).status).toBe(400);
+    expect((await call('/api/auth/reset', json({ token, password: 'nueva-clave-1' }))).status).toBe(200);
+    expect((await call('/api/auth/reset', json({ token, password: 'otra-clave-22' }))).status).toBe(400); // used
+
+    // The old session (tv 0) ended; the new password works
+    expect((await call('/api/orders', {}, true)).status).toBe(401);
+    const login = await call('/api/auth/login', json({ username: 'ana', password: 'nueva-clave-1' }));
+    expect(login.status).toBe(200);
+  });
+
+  it('rejects expired links', async () => {
+    const token = 'b'.repeat(64);
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(token));
+    const hash = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+    await client.query("INSERT INTO password_resets (user_id, token_hash, expires_at) VALUES (1, $1, now() - interval '1 minute')", [hash]);
+    expect((await call('/api/auth/reset', json({ token, password: 'nueva-clave-1' }))).status).toBe(400);
+  });
+});
+
+describe('manual orders, edits and notes', () => {
+  const manual = { name: 'Rosa', phone: '(413) 555-0001', paymentMethod: 'cash', items: [{ productId: 1, quantity: 1 }] };
+
+  it('creates an order from the panel with only name and phone', async () => {
+    expect((await call('/api/orders/manual', json(manual))).status).toBe(401);
+    const res = await call('/api/orders/manual', json(manual), true);
+    expect(res.status).toBe(201);
+    expect(await res.json()).toMatchObject({ source: 'manual', total: 120.5, status: 'pending', customerEmail: '' });
+    expect(sentMails).toEqual([]); // no email given
+    expect((await call('/api/orders/manual', json({ ...manual, email: 'rosa@test.dev' }), true)).status).toBe(201);
+    expect(sentMails.map((m) => m.to)).toEqual(['rosa@test.dev']);
+    expect((await call('/api/orders/manual', json({ ...manual, items: [{ productId: 2, quantity: 9 }] }), true)).status).toBe(409);
+  });
+
+  it('edits products and customer data while the order has not taken stock', async () => {
+    await call('/api/orders/manual', json(manual), true);
+    const edit = (body: Record<string, unknown>) =>
+      call('/api/orders/1', { method: 'PUT', body: JSON.stringify({ ...manual, ...body }) }, true);
+    const res = await edit({ name: 'Rosa M.', items: [{ productId: 1, quantity: 2 }, { productId: 2, quantity: 1 }] });
+    expect(await res.json()).toMatchObject({ customerName: 'Rosa M.', total: 321 });
+
+    await call('/api/orders/1/status', { method: 'PATCH', body: JSON.stringify({ status: 'paid' }) }, true);
+    expect((await edit({})).status).toBe(409);
+  });
+
+  it('keeps internal notes', async () => {
+    await call('/api/orders/manual', json(manual), true);
+    const res = await call('/api/orders/1/notes', { method: 'PATCH', body: JSON.stringify({ adminNotes: 'Envolver para regalo' }) }, true);
+    expect(await res.json()).toMatchObject({ adminNotes: 'Envolver para regalo' });
+    // Not in the customer's view
+    const tracked = await (await call('/api/orders/track?id=1&phone=4135550001')).json();
+    expect(JSON.stringify(tracked)).not.toContain('regalo');
+  });
+});
+
+describe('customers', () => {
+  it('groups orders by phone and adds up what each customer bought', async () => {
+    const order = (phone: string, productId: number) =>
+      call('/api/orders', json({ ...customer, phone, items: [{ productId, quantity: 1 }] }));
+    await order('413-555-0001', 1);
+    await order('+1 (413) 555-0001', 2);
+    await order('413-555-0002', 2);
+    await call('/api/orders/1/status', { method: 'PATCH', body: JSON.stringify({ status: 'paid' }) }, true);
+
+    expect((await call('/api/orders/customers')).status).toBe(401);
+    const list = (await (await call('/api/orders/customers', {}, true)).json()) as Array<Record<string, unknown>>;
+    expect(list).toHaveLength(2);
+    const rosa = list.find((c) => c.key === '4135550001');
+    expect(rosa).toMatchObject({ orders: 2, openOrders: 1, spent: 120.5, orderIds: [2, 1] });
+  });
+});
+
+describe('cost at sale time', () => {
+  it('keeps the cost the product had when it was sold', async () => {
+    await client.exec('UPDATE products SET cost = 50 WHERE id = 1');
+    await call('/api/sales', json({ productId: 1, quantity: 1 }), true);
+    await client.exec('UPDATE products SET cost = 70 WHERE id = 1');
+    const [sale] = (await (await call('/api/sales', {}, true)).json()) as Array<{ unitCost: number }>;
+    expect(sale.unitCost).toBe(50);
+  });
+});
+
+describe('deleting a product', () => {
+  it('also deletes its image files', async () => {
+    await client.exec("INSERT INTO products (code, name, name_en, slug, category_id, subcategory_id, price, stock) VALUES ('N1', 'Nuevo', 'New', 'nuevo', 1, 1, 10, 0)");
+    await client.exec("INSERT INTO product_images (product_id, filename, data) VALUES (4, 'a.jpg', 'https://cdn.test/products/4/a.jpg')");
+    bucket.objects.set('products/4/a.jpg', { bytes: new ArrayBuffer(1) });
+    expect((await call('/api/products/4', { method: 'DELETE' }, true)).status).toBe(200);
+    expect(bucket.objects.has('products/4/a.jpg')).toBe(false);
   });
 });

@@ -213,6 +213,7 @@ const PAYMENT_LABEL: Record<string, string> = {
   transfer: 'Transferencia',
   paypal: 'PayPal o tarjeta',
   whatsapp: 'WhatsApp',
+  cash: 'Efectivo',
   googlepay: 'Google Pay',
 };
 
@@ -360,5 +361,21 @@ export function testMail(env: MailEnv, to: string): Mail {
     subject: 'Correo de prueba - Alexandra Jewelry',
     html: layout('¡Funciona!', '<p>Este es un correo de prueba. Los avisos de pedidos y mensajes de la tienda se enviarán con esta cuenta.</p>'),
     text: 'Este es un correo de prueba. Los avisos de la tienda se enviarán con esta cuenta.',
+  };
+}
+
+/** To an admin who forgot the password: one-hour link to set a new one. */
+export function passwordResetMail(env: MailEnv, to: string, username: string, token: string): Mail {
+  const link = `${siteUrl(env)}/admin/reset-password?token=${token}`;
+  return {
+    to,
+    subject: 'Crea una contraseña nueva - Panel Alexandra Jewelry',
+    html: layout(
+      'Contraseña nueva',
+      `<p>Hola ${escapeHtml(username)},</p><p>Pediste crear una contraseña nueva para el panel de la tienda. El enlace sirve una sola vez y vence en 1 hora.</p>` +
+        button(link, 'Crear contraseña nueva') +
+        `<p style="font-size:13px;color:#666">Si no lo pediste, ignora este correo: tu contraseña no cambia.</p>`,
+    ),
+    text: `Hola ${username},\n\nPara crear una contraseña nueva abre este enlace (sirve una vez y vence en 1 hora):\n${link}\n\nSi no lo pediste, ignora este correo.`,
   };
 }
