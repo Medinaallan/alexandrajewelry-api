@@ -12,6 +12,7 @@ import {
 } from '../db/inventory';
 import { rateLimit } from '../middleware/rateLimit';
 import { readPaypalSettings } from './settings';
+import { SquareApiError, createPayment, declineMessage, describePayment, refundPayment, squareForCharging } from '../square';
 import { parseFields, parseId, toMoney } from '../utils/validate';
 import {
   executionCtx,
@@ -20,6 +21,7 @@ import {
   newOrderStoreMail,
   orderReceivedMail,
   paypalStoreMail,
+  squareStoreMail,
   receiptStoreMail,
   sendMail,
   statusMail,
@@ -31,7 +33,10 @@ import {
 type Bindings = { DATABASE_URL: string; JWT_SECRET: string; IMAGES: R2Bucket } & MailEnv;
 type Variables = { username: string };
 
-const PAYMENT_METHODS = ['transfer', 'googlepay', 'paypal', 'whatsapp'];
+// square: card, Google Pay or Apple Pay, charged through Square
+const PAYMENT_METHODS = ['transfer', 'googlepay', 'paypal', 'square', 'whatsapp'];
+// Paid by the customer on the site after ordering; unpaid ones expire in 24 h
+const ONLINE_METHODS = ['paypal', 'square'];
 // Orders entered in the panel can also be paid in cash at the store
 const MANUAL_PAYMENT_METHODS = ['transfer', 'paypal', 'whatsapp', 'cash'];
 // `review`: the customer reported a PayPal payment the admin has not checked yet.
@@ -40,7 +45,7 @@ const ORDER_STATUSES = ['pending', 'confirmed', 'review', 'paid', 'shipped', 'de
 // Entering one sells the items; leaving to any other status undoes that.
 const STOCK_TAKEN = new Set(['review', 'paid', 'shipped', 'delivered']);
 
-/** An unpaid PayPal order is cancelled this long after it was placed. */
+/** An unpaid PayPal or Square order is cancelled this long after it was placed. */
 export const PAYPAL_HOLD_MS = 24 * 60 * 60 * 1000;
 
 type OrderItem = { productId: number; name: string; price: number; quantity: number };
@@ -91,18 +96,21 @@ function toMailOrder(row: OrderRow): OrderForMail {
   };
 }
 
-/** A PayPal order still waiting for its payment, within its 24 hours. */
-function canPayWithPaypal(row: OrderRow, now = Date.now()): boolean {
+/** An online (PayPal / Square) order still waiting for its payment, within its 24 hours. */
+function canPayOnline(row: OrderRow, now = Date.now()): boolean {
   return (
-    row.paymentMethod === 'paypal' &&
+    ONLINE_METHODS.includes(row.paymentMethod) &&
     (row.status === 'pending' || row.status === 'confirmed') &&
     row.paymentRef == null &&
     now - new Date(row.createdAt).getTime() < PAYPAL_HOLD_MS
   );
 }
 
+const canPayWithPaypal = (row: OrderRow) => row.paymentMethod === 'paypal' && canPayOnline(row);
+const canPayWithSquare = (row: OrderRow) => row.paymentMethod === 'square' && canPayOnline(row);
+
 /**
- * Cancels PayPal orders nobody paid within 24 hours and tells each customer.
+ * Cancels PayPal and Square orders nobody paid within 24 hours and tells each customer.
  * Run by the hourly cron. No stock to return: unpaid orders never took any.
  */
 export async function expireUnpaidPaypalOrders(db: Db, env: MailEnv): Promise<number> {
@@ -111,7 +119,7 @@ export async function expireUnpaidPaypalOrders(db: Db, env: MailEnv): Promise<nu
     .set({ status: 'cancelled' })
     .where(
       and(
-        eq(ordersTable.paymentMethod, 'paypal'),
+        inArray(ordersTable.paymentMethod, ONLINE_METHODS),
         // Orders typed in the panel are followed up by the operator, never expired
         eq(ordersTable.source, 'web'),
         inArray(ordersTable.status, ['pending', 'confirmed']),
@@ -218,9 +226,9 @@ function parseAdminCustomer(payload: unknown) {
 /** The store's time zone: "today" on the summary page means its day. */
 const STORE_TIMEZONE = 'America/New_York';
 
-/** Waiting for the operator to collect the payment (not a PayPal order waiting for the customer). */
+/** Waiting for the operator to collect the payment (not a PayPal / Square order waiting for the customer). */
 // (Orders typed in the panel are always collected by the operator, PayPal included.)
-const NEEDS_PAYMENT = sql`${ordersTable.status} in ('pending', 'confirmed') and not (${ordersTable.paymentMethod} = 'paypal' and ${ordersTable.paymentRef} is null and ${ordersTable.source} = 'web')`;
+const NEEDS_PAYMENT = sql`${ordersTable.status} in ('pending', 'confirmed') and not (${ordersTable.paymentMethod} in ('paypal', 'square') and ${ordersTable.paymentRef} is null and ${ordersTable.source} = 'web')`;
 
 /**
  * Saves a transfer receipt for the order and, if the order is still waiting,
@@ -296,7 +304,7 @@ orders.get('/dashboard', requireAuth, async (c) => {
         toVerify: sql<number>`cast(count(*) filter (where ${ordersTable.status} = 'review') as int)`,
         stockShort: sql<number>`cast(count(*) filter (where ${ordersTable.status} in ('pending', 'confirmed') and ${ordersTable.paymentRef} is not null) as int)`,
         toShip: sql<number>`cast(count(*) filter (where ${ordersTable.status} = 'paid') as int)`,
-        paypalWaiting: sql<number>`cast(count(*) filter (where ${ordersTable.status} in ('pending', 'confirmed') and ${ordersTable.paymentMethod} = 'paypal' and ${ordersTable.paymentRef} is null and ${ordersTable.source} = 'web') as int)`,
+        paypalWaiting: sql<number>`cast(count(*) filter (where ${ordersTable.status} in ('pending', 'confirmed') and ${ordersTable.paymentMethod} in ('paypal', 'square') and ${ordersTable.paymentRef} is null and ${ordersTable.source} = 'web') as int)`,
         ordersToday: sql<number>`cast(count(*) filter (where ${localDate(ordersTable.createdAt)} = ${today}) as int)`,
       })
       .from(ordersTable),
@@ -349,6 +357,9 @@ orders.post('/', rateLimit('PUBLIC_LIMITER'), async (c) => {
   if (order.paymentMethod === 'paypal') {
     const paypal = await readPaypalSettings(c.env.DATABASE_URL);
     if (paypal && !paypal.enabled) return c.json({ error: 'El pago con PayPal no está disponible. Elige otra forma de pago.' }, 400);
+  }
+  if (order.paymentMethod === 'square' && !(await squareForCharging(c.env))) {
+    return c.json({ error: 'El pago con tarjeta no está disponible. Elige otra forma de pago.' }, 400);
   }
 
   if (receipt) {
@@ -508,7 +519,7 @@ orders.get('/track', rateLimit('PUBLIC_LIMITER'), async (c) => {
     total: row.total,
     createdAt: row.createdAt,
     paymentReported: row.paymentRef != null,
-    canPay: canPayWithPaypal(row),
+    canPay: canPayOnline(row),
     receiptSent: row.receiptAt != null,
     canUploadReceipt: row.paymentMethod === 'transfer' && ['pending', 'confirmed'].includes(row.status),
     items: items.map((i) => ({ name: i.name, quantity: i.quantity, subtotal: i.subtotal })),
@@ -612,6 +623,97 @@ orders.post('/:id/paypal', rateLimit('PUBLIC_LIMITER'), async (c) => {
     ]),
   );
   return c.json({ ok: true, stockShort });
+});
+
+// Public: the customer pays a Square order (card, Google Pay or Apple Pay).
+// The browser sends the one-time token from Square's payment form; this API
+// charges it with the store's token, so the payment is confirmed: the order
+// goes straight to "paid" and its stock is taken. If two payments race for
+// the same order, the second one is refunded right away.
+orders.post('/:id/square', rateLimit('PUBLIC_LIMITER'), async (c) => {
+  const body = await c.req.json<unknown>().catch(() => null);
+  const parsed = parseFields(body, {
+    phone: { type: 'string', min: 1, max: 40 },
+    sourceId: { type: 'string', min: 1, max: 500 },
+    verificationToken: { type: 'string', max: 2000 },
+  } as const, ['phone', 'sourceId']);
+  if (!parsed.ok) return c.json({ error: parsed.error }, 400);
+  const { phone, sourceId, verificationToken } = parsed.data;
+
+  const db = getDb(c.env.DATABASE_URL);
+  const row = await orderForCustomer(db, parseId(c.req.param('id')), phone);
+  if (!row) return c.json({ error: notFoundMsg }, 404);
+  if (!canPayWithSquare(row)) {
+    return c.json({ error: 'Este pedido ya no se puede pagar (venció, ya tiene un pago o fue cancelado).' }, 409);
+  }
+  // Nobody pays for a piece that sold out meanwhile
+  const short = await shortItem(db, row);
+  if (short) {
+    return c.json({ error: `Lo sentimos: "${short.name}" se agotó. No se te cobró nada; escríbenos y te ayudamos con tu pedido.` }, 409);
+  }
+  const square = await squareForCharging(c.env);
+  if (!square) return c.json({ error: 'El pago con tarjeta no está disponible en este momento. Escríbenos y te ayudamos a pagar.' }, 503);
+
+  // The amount always comes from the order, never from the browser
+  let payment;
+  try {
+    payment = await createPayment(square, {
+      sourceId,
+      verificationToken: verificationToken || undefined,
+      amount: row.total,
+      orderId: row.id,
+      email: row.customerEmail || undefined,
+    });
+  } catch (err) {
+    if (!(err instanceof SquareApiError) || err.status >= 500 || err.status === 401) console.error('Square payment failed for order', row.id, err);
+    return c.json({ error: declineMessage(err) }, 402);
+  }
+  if (payment.status !== 'COMPLETED' && payment.status !== 'APPROVED') {
+    return c.json({ error: declineMessage(null) }, 402);
+  }
+
+  const amount = toMoney((payment.amount_money?.amount ?? Math.round(row.total * 100)) / 100);
+  const noted = await db
+    .update(ordersTable)
+    .set({ paymentRef: payment.id, paymentAmount: amount })
+    .where(and(eq(ordersTable.id, row.id), isNull(ordersTable.paymentRef)))
+    .returning({ id: ordersTable.id });
+  if (noted.length === 0) {
+    // Another payment got there first: give this one back
+    try {
+      await refundPayment(square, payment, `Pedido #${row.id} ya estaba pagado`);
+    } catch (err) {
+      console.error('Could not refund duplicate Square payment', payment.id, err);
+    }
+    return c.json({ error: 'Este pedido ya tenía un pago. Te devolvimos este cobro.' }, 409);
+  }
+
+  let stockShort = false;
+  const method = describePayment(payment);
+  try {
+    const items = (Array.isArray(row.items) ? row.items : []) as OrderItem[];
+    await registerSales(
+      db,
+      items.map((i) => ({ productId: i.productId, quantity: i.quantity, unitPrice: i.price, notes: `Pedido #${row.id} (${method})` })),
+      'Square',
+      { id: row.id, from: row.status, to: 'paid' },
+    );
+  } catch (err) {
+    if (err instanceof InsufficientStockError) stockShort = true;
+    else if (!(err instanceof OrderChangedError)) throw err;
+  }
+
+  const menv = await withStore(c.env);
+  const mailOrder = toMailOrder(row);
+  const customerMail = stockShort ? null : statusMail(menv, mailOrder, 'paid');
+  await inBackground(
+    executionCtx(c),
+    Promise.all([
+      sendMail(menv, squareStoreMail(menv, mailOrder, { id: payment.id, amount, method, environment: square.environment }, stockShort)),
+      customerMail ? sendMail(menv, customerMail) : false,
+    ]),
+  );
+  return c.json({ ok: true, paymentId: payment.id, receiptUrl: payment.receipt_url ?? null, method, stockShort });
 });
 
 // Public: the customer attaches the transfer receipt after ordering (from

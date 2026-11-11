@@ -78,11 +78,11 @@ export { app };
 
 export default {
   fetch: app.fetch,
-  // Hourly cron (wrangler.toml): cancels PayPal orders unpaid after 24 hours
+  // Hourly cron (wrangler.toml): cancels PayPal / Square orders unpaid after 24 hours
   async scheduled(_event: ScheduledController, env: Bindings, ctx: ExecutionContext) {
     ctx.waitUntil(
       expireUnpaidPaypalOrders(getDb(env.DATABASE_URL), env).then((n) => {
-        if (n > 0) console.log(`Cancelled ${n} unpaid PayPal order(s)`);
+        if (n > 0) console.log(`Cancelled ${n} unpaid online order(s)`);
       }),
     );
   },

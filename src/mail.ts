@@ -225,6 +225,7 @@ export type OrderForMail = {
 const PAYMENT_LABEL: Record<string, string> = {
   transfer: 'Transferencia',
   paypal: 'PayPal o tarjeta',
+  square: 'Tarjeta, Google Pay o Apple Pay',
   whatsapp: 'WhatsApp',
   cash: 'Efectivo',
   googlepay: 'Google Pay',
@@ -253,7 +254,7 @@ export function orderReceivedMail(env: MailEnv, o: OrderForMail, receiptAttached
   const accounts = env.BANK_ACCOUNTS ?? [];
   const isTransfer = o.paymentMethod === 'transfer';
   const pay =
-    o.paymentMethod === 'paypal'
+    o.paymentMethod === 'paypal' || o.paymentMethod === 'square'
       ? 'Si aún no pagaste, puedes hacerlo desde el seguimiento de tu pedido durante las próximas 24 horas.'
       : isTransfer && receiptAttached
         ? 'Recibimos tu comprobante de pago. Lo verificaremos y te avisaremos.'
@@ -373,6 +374,40 @@ export function paypalStoreMail(env: MailEnv, o: OrderForMail, captureId: string
       env,
     ),
     text: `Pago PayPal del pedido #${o.id}\nReferencia: ${captureId}\nMonto: ${money(amount)}${mismatch}\n${warn}`,
+  };
+}
+
+/** To the store when a Square payment (card, Google Pay, Apple Pay) went through. Already confirmed by Square. */
+export function squareStoreMail(
+  env: MailEnv,
+  o: OrderForMail,
+  payment: { id: string; amount: number; method: string; environment: 'production' | 'sandbox' },
+  stockShort: boolean,
+): Mail {
+  const warn = stockShort
+    ? 'ATENCIÓN: ya no hay stock suficiente para este pedido. Repón el stock o cancela el pedido y reembolsa el pago desde Square.'
+    : 'El pago ya está confirmado por Square y el stock quedó descontado. Solo falta preparar y enviar el pedido.';
+  const test = payment.environment === 'sandbox' ? ' (PRUEBA, no es dinero real)' : '';
+  const dashboard = payment.environment === 'sandbox'
+    ? 'https://app.squareupsandbox.com/dashboard/sales/transactions'
+    : 'https://app.squareup.com/dashboard/sales/transactions';
+  return {
+    to: storeEmail(env),
+    subject: `Pago con ${payment.method} pedido #${o.id} - ${money(payment.amount)}${test}${stockShort ? ' - SIN STOCK' : ''}`,
+    html: layout(
+      `Pago confirmado del pedido #${o.id}`,
+      `<p>Forma de pago: <strong>${escapeHtml(payment.method)}</strong>${escapeHtml(test)}<br>Monto: <strong>${money(payment.amount)}</strong><br>Referencia Square: ${escapeHtml(payment.id)}</p>` +
+        `<p style="color:${stockShort ? '#c0392b' : '#333'}">${escapeHtml(warn)}</p>` +
+        itemsTable(o.items, o.total) +
+        button(`${siteUrl(env)}/admin/orders`, 'Abrir pedidos') +
+        `<p style="font-size:13px"><a href="${dashboard}">Ver pagos en Square</a></p>`,
+      env,
+    ),
+    text: `Pago confirmado del pedido #${o.id}${test}
+Forma de pago: ${payment.method}
+Monto: ${money(payment.amount)}
+Referencia Square: ${payment.id}
+${warn}`,
   };
 }
 

@@ -12,7 +12,7 @@ SITE_URL = "https://alexandrajewelry.vercel.app"
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = "465"
 
-# Hourly: cancels PayPal orders still unpaid 24 hours after being placed
+# Hourly: cancels PayPal / Square orders still unpaid 24 hours after being placed
 [triggers]
 crons = ["0 * * * *"]
 

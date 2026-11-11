@@ -1,4 +1,4 @@
-import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { PGlite } from '@electric-sql/pglite';
 import { drizzle } from 'drizzle-orm/pglite';
 import { createRequire } from 'node:module';
@@ -655,14 +655,14 @@ describe('PayPal settings', () => {
   const publicConfig = async () => (await (await call('/api/settings/public/payments')).json()) as { paypal: Record<string, unknown> };
 
   it('is not configured until the admin saves it', async () => {
-    expect(await publicConfig()).toEqual({ paypal: { configured: false } });
+    expect(await publicConfig()).toMatchObject({ paypal: { configured: false } });
     expect((await call('/api/settings/paypal')).status).toBe(401);
   });
 
   it('saves the Client ID and publishes it for the checkout', async () => {
     expect((await put({ enabled: true, clientId: 'corto' })).status).toBe(400);
     expect((await put({ enabled: true, clientId: CLIENT_ID })).status).toBe(200);
-    expect(await publicConfig()).toEqual({ paypal: { configured: true, enabled: true, clientId: CLIENT_ID } });
+    expect(await publicConfig()).toMatchObject({ paypal: { configured: true, enabled: true, clientId: CLIENT_ID } });
     expect(await (await call('/api/settings/paypal', {}, true)).json()).toEqual({ configured: true, enabled: true, clientId: CLIENT_ID });
   });
 
@@ -937,5 +937,157 @@ describe('reviews', () => {
     await call('/api/testimonials', json({ name: 'Eva', text: 'Hermoso', rating: 5, email: 'eva@test.dev', productPurchased: 'Anillo' }));
     const [admin] = (await (await call('/api/admin/testimonials?status=pending', {}, true)).json()) as Array<Record<string, unknown>>;
     expect(admin).toMatchObject({ email: 'eva@test.dev', productPurchased: 'Anillo' });
+  });
+});
+
+describe('Square payments (card, Google Pay, Apple Pay)', () => {
+  const APP_ID = 'sandbox-sq0idb-AbCdEfGhIjKlMnOp';
+  const LOCATION = 'L8XYZ123ABC';
+  const ACCESS = 'EAAAl_test_token_0123456789abcdef';
+  const methods = { card: true, googlePay: true, applePay: false };
+  const put = (body: unknown) => call('/api/settings/square', { method: 'PUT', body: JSON.stringify(body) }, true);
+  const publicSquare = async () => ((await (await call('/api/settings/public/payments')).json()) as { square: Record<string, unknown> }).square;
+  const squareOrder = (productId = 1, quantity = 1) =>
+    call('/api/orders', json({ ...customer, phone: '412-555-1234', paymentMethod: 'square', items: [{ productId, quantity }] }));
+  const pay = (id: number, body: Record<string, unknown> = {}) =>
+    call(`/api/orders/${id}/square`, json({ phone: '4125551234', sourceId: 'cnon:card-nonce-ok', ...body }));
+
+  // Square's API, as seen by the Worker
+  let squareCalls: Array<{ url: string; body: Record<string, unknown> | null; auth: string | null }> = [];
+  let paymentResponse: () => Response | Promise<Response>;
+  beforeEach(() => {
+    squareCalls = [];
+    paymentResponse = () =>
+      Response.json({
+        payment: {
+          id: 'PAY1',
+          status: 'COMPLETED',
+          amount_money: { amount: 24100, currency: 'USD' },
+          source_type: 'CARD',
+          card_details: { card: { card_brand: 'VISA', last_4: '1111' } },
+          receipt_url: 'https://squareup.com/receipt/preview/PAY1',
+        },
+      });
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = String(input);
+      const body = typeof init?.body === 'string' ? (JSON.parse(init.body) as Record<string, unknown>) : null;
+      const auth = new Headers(init?.headers).get('Authorization');
+      squareCalls.push({ url, body, auth });
+      if (url.includes('/v2/locations/')) {
+        return auth === `Bearer ${ACCESS}`
+          ? Response.json({ location: { id: LOCATION, name: 'Alexandra Jewelry', currency: 'USD', status: 'ACTIVE' } })
+          : Response.json({ errors: [{ code: 'UNAUTHORIZED', category: 'AUTHENTICATION_ERROR' }] }, { status: 401 });
+      }
+      if (url.endsWith('/v2/payments')) return paymentResponse();
+      if (url.endsWith('/v2/refunds')) return Response.json({ refund: { id: 'REF1', status: 'PENDING' } });
+      throw new Error(`Unexpected fetch ${url}`);
+    });
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  const charges = () => squareCalls.filter((c) => c.url.endsWith('/v2/payments'));
+  const enable = () => put({ enabled: true, environment: 'sandbox', applicationId: APP_ID, locationId: LOCATION, accessToken: ACCESS, methods });
+
+  it('is off and hidden until configured; rejects Square orders meanwhile', async () => {
+    expect(await publicSquare()).toMatchObject({ enabled: false, applicationId: '' });
+    expect((await squareOrder()).status).toBe(400);
+    expect((await call('/api/settings/square')).status).toBe(401);
+  });
+
+  it('checks the credentials with Square and never publishes the token', async () => {
+    // Sandbox app id in production mode, a token Square rejects, no method on
+    expect((await put({ enabled: true, environment: 'production', applicationId: APP_ID, locationId: LOCATION, accessToken: ACCESS, methods })).status).toBe(400);
+    expect((await put({ enabled: true, environment: 'sandbox', applicationId: APP_ID, locationId: LOCATION, accessToken: 'EAAAl_wrong_token_00000000000', methods })).status).toBe(400);
+    expect((await put({ enabled: true, environment: 'sandbox', applicationId: APP_ID, locationId: LOCATION, accessToken: ACCESS, methods: {} })).status).toBe(400);
+
+    const ok = await enable();
+    expect(ok.status).toBe(200);
+    expect(await ok.json()).toEqual({ ok: true, locationName: 'Alexandra Jewelry' });
+    expect(squareCalls.at(-1)).toMatchObject({ url: `https://connect.squareupsandbox.com/v2/locations/${LOCATION}`, auth: `Bearer ${ACCESS}` });
+
+    expect(await publicSquare()).toEqual({ enabled: true, environment: 'sandbox', applicationId: APP_ID, locationId: LOCATION, methods });
+    const admin = (await (await call('/api/settings/square', {}, true)).json()) as Record<string, unknown>;
+    expect(admin).toMatchObject({ enabled: true, hasToken: true, live: true, locationName: 'Alexandra Jewelry' });
+    expect(JSON.stringify(admin)).not.toContain(ACCESS);
+    const [row] = (await client.query<{ value: unknown }>(`SELECT value FROM settings WHERE key = 'square'`)).rows;
+    expect(JSON.stringify(row.value)).not.toContain(ACCESS);
+
+    // Saving again without the token keeps it
+    expect((await put({ enabled: true, environment: 'sandbox', applicationId: APP_ID, locationId: LOCATION, methods })).status).toBe(200);
+    expect((await publicSquare()).enabled).toBe(true);
+  });
+
+  it('charges the order total, never the browser amount, and marks the order paid', async () => {
+    await enable();
+    await squareOrder(1, 2);
+    const res = await pay(1, { amount: 0.01 });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ ok: true, paymentId: 'PAY1', method: 'Visa •••• 1111', stockShort: false });
+
+    expect(charges()[0]?.body).toMatchObject({
+      source_id: 'cnon:card-nonce-ok',
+      amount_money: { amount: 24100, currency: 'USD' },
+      location_id: LOCATION,
+      reference_id: '1',
+      autocomplete: true,
+    });
+    const [order] = (await (await call('/api/orders', {}, true)).json()) as Array<Record<string, unknown>>;
+    expect(order).toMatchObject({ status: 'paid', paymentRef: 'PAY1', paymentAmount: 241 });
+    const [product] = (await client.query<{ stock: number }>('SELECT stock FROM products WHERE id = 1')).rows;
+    expect(product.stock).toBe(3);
+    expect(sentMails.map((m) => m.subject)).toEqual(
+      expect.arrayContaining([expect.stringContaining('Pago con Visa'), expect.stringContaining('Pago confirmado')]),
+    );
+
+    // A second payment for the same order is refused before charging
+    expect((await pay(1)).status).toBe(409);
+    expect(charges()).toHaveLength(1);
+  });
+
+  it('a declined card leaves the order waiting, with a clear message', async () => {
+    await enable();
+    await squareOrder();
+    paymentResponse = () => Response.json({ errors: [{ code: 'INSUFFICIENT_FUNDS', category: 'PAYMENT_METHOD_ERROR' }] }, { status: 402 });
+    const res = await pay(1);
+    expect(res.status).toBe(402);
+    expect(((await res.json()) as { error: string }).error).toMatch(/fondos suficientes/);
+    const [order] = (await (await call('/api/orders', {}, true)).json()) as Array<Record<string, unknown>>;
+    expect(order).toMatchObject({ status: 'pending', paymentRef: null });
+  });
+
+  it('does not charge if a product sold out, or with the wrong phone', async () => {
+    await enable();
+    await squareOrder(2, 2);
+    await client.exec('UPDATE products SET stock = 1 WHERE id = 2');
+    expect((await pay(1)).status).toBe(409);
+    expect((await pay(1, { phone: '999' })).status).toBe(404);
+    expect(charges()).toHaveLength(0);
+  });
+
+  it('refunds a payment that lost the race to another one', async () => {
+    await enable();
+    await squareOrder();
+    // Another payment gets noted while this one is being charged
+    paymentResponse = async () => {
+      await client.exec(`UPDATE orders SET payment_ref = 'OTHER' WHERE id = 1`);
+      return Response.json({ payment: { id: 'PAY2', status: 'COMPLETED', amount_money: { amount: 12050, currency: 'USD' } } });
+    };
+    const res = await pay(1);
+    expect(res.status).toBe(409);
+    expect(squareCalls.find((c) => c.url.endsWith('/v2/refunds'))?.body).toMatchObject({
+      payment_id: 'PAY2',
+      amount_money: { amount: 12050, currency: 'USD' },
+    });
+  });
+
+  it('unpaid Square orders also expire after 24 hours', async () => {
+    await enable();
+    await squareOrder();
+    await client.exec(`UPDATE orders SET created_at = now() - interval '25 hours'`);
+    const { expireUnpaidPaypalOrders } = await import('../src/routes/orders');
+    const { getDb } = await import('../src/db');
+    expect(await expireUnpaidPaypalOrders(getDb('unused'), env())).toBe(1);
   });
 });

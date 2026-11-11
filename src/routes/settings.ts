@@ -19,6 +19,7 @@ import {
   deliver,
   isEmail,
   loadSmtpConfig,
+  siteUrl,
   storeEmail,
   testMail,
   withStore,
@@ -26,6 +27,16 @@ import {
   type MailEnv,
   type StoredSmtp,
 } from '../mail';
+import {
+  SQUARE_SETTINGS_KEY,
+  SquareApiError,
+  getLocation,
+  publicSquare,
+  readSquareSettings,
+  registerApplePayDomain,
+  type SquareEnvironment,
+  type StoredSquare,
+} from '../square';
 
 type Bindings = { DATABASE_URL: string; JWT_SECRET: string } & MailEnv;
 type Variables = { username: string };
@@ -46,17 +57,21 @@ export async function readPaypalSettings(databaseUrl: string): Promise<PaypalSet
 }
 
 settings.get('/public/payments', async (c) => {
-  const paypal = await readPaypalSettings(c.env.DATABASE_URL);
+  const [paypal, square] = await Promise.all([readPaypalSettings(c.env.DATABASE_URL), readSquareSettings(c.env.DATABASE_URL)]);
   c.header('Cache-Control', 'public, max-age=60');
-  return c.json({ paypal: paypal ? { configured: true, enabled: paypal.enabled, clientId: paypal.clientId } : { configured: false } });
+  return c.json({
+    paypal: paypal ? { configured: true, enabled: paypal.enabled, clientId: paypal.clientId } : { configured: false },
+    square: publicSquare(square),
+  });
 });
 
-// Everything the public site needs: store details, bank accounts, PayPal.
+// Everything the public site needs: store details, bank accounts, PayPal, Square.
 settings.get('/public', async (c) => {
-  const [store, bankAccounts, paypal] = await Promise.all([
+  const [store, bankAccounts, paypal, square] = await Promise.all([
     getStoreSettings(c.env.DATABASE_URL),
     getBankAccounts(c.env.DATABASE_URL),
     readPaypalSettings(c.env.DATABASE_URL),
+    readSquareSettings(c.env.DATABASE_URL),
   ]);
   const { notifyEmail: _private, ...publicStore } = store;
   c.header('Cache-Control', 'public, max-age=60');
@@ -64,6 +79,7 @@ settings.get('/public', async (c) => {
     store: publicStore,
     bankAccounts,
     paypal: paypal ? { configured: true, enabled: paypal.enabled, clientId: paypal.clientId } : { configured: false },
+    square: publicSquare(square),
   });
 });
 
@@ -73,6 +89,8 @@ settings.get('/public', async (c) => {
 settings.use('/mail', requireAuth, requireAdmin);
 settings.use('/mail/*', requireAuth, requireAdmin);
 settings.use('/paypal', requireAuth, requireAdmin);
+settings.use('/square', requireAuth, requireAdmin);
+settings.use('/square/*', requireAuth, requireAdmin);
 settings.use('/store', requireAuth, requireAdmin);
 settings.use('/bank', requireAuth, requireAdmin);
 
@@ -167,6 +185,142 @@ settings.put('/paypal', async (c) => {
     .values({ key: PAYPAL_SETTINGS_KEY, value, updatedBy })
     .onConflictDoUpdate({ target: settingsTable.key, set: { value, updatedBy, updatedAt: new Date() } });
   return c.json({ ok: true });
+});
+
+// ─── Square: cards, Google Pay and Apple Pay ─────────────────────────────────
+
+// Application IDs say which environment they belong to
+// Production: "sq0idp-…"; Sandbox: "sandbox-sq0idb-…"
+const SQUARE_APP_ID = /^(sandbox-)?sq0id[a-z]-[A-Za-z0-9_-]{10,100}$/;
+const SQUARE_LOCATION_ID = /^[A-Za-z0-9]{6,40}$/;
+const SQUARE_TOKEN = /^[A-Za-z0-9_-]{20,200}$/;
+
+/** The token, if the saved one can still be decrypted. */
+async function storedSquareToken(c: { env: Bindings }, s: StoredSquare | null) {
+  return s?.tokenSealed ? open(c.env.JWT_SECRET, s.tokenSealed) : null;
+}
+
+settings.get('/square', async (c) => {
+  const s = await readSquareSettings(c.env.DATABASE_URL);
+  const token = await storedSquareToken(c, s);
+  return c.json({
+    configured: s !== null,
+    enabled: s?.enabled ?? false,
+    environment: s?.environment ?? 'production',
+    applicationId: s?.applicationId ?? '',
+    locationId: s?.locationId ?? '',
+    locationName: s?.locationName ?? '',
+    methods: s?.methods ?? { card: true, googlePay: true, applePay: true },
+    hasToken: token !== null,
+    // Saved, but the key changed: it has to be entered again
+    tokenUnreadable: Boolean(s?.tokenSealed) && token === null,
+    // What the checkout actually offers right now
+    live: publicSquare(s).enabled,
+  });
+});
+
+// Save Square. An empty token keeps the one already saved. The credentials
+// are checked with Square before saving, so a typo shows up here and not
+// when a customer tries to pay.
+settings.put('/square', async (c) => {
+  const body = await c.req.json<Record<string, unknown>>();
+  if (typeof body.enabled !== 'boolean') return c.json({ error: 'Invalid request' }, 400);
+  const environment: SquareEnvironment = body.environment === 'sandbox' ? 'sandbox' : 'production';
+  const applicationId = typeof body.applicationId === 'string' ? body.applicationId.trim() : '';
+  const locationId = typeof body.locationId === 'string' ? body.locationId.trim() : '';
+  const newToken = typeof body.accessToken === 'string' ? body.accessToken.trim() : '';
+  const rawMethods = (body.methods ?? {}) as Record<string, unknown>;
+  const methods = {
+    card: rawMethods.card === true,
+    googlePay: rawMethods.googlePay === true,
+    applePay: rawMethods.applePay === true,
+  };
+
+  if (applicationId && !SQUARE_APP_ID.test(applicationId)) {
+    return c.json({ error: 'El Application ID no es válido. Empieza por «sq0idp-» (o «sandbox-sq0idb-» en pruebas).' }, 400);
+  }
+  if (applicationId && applicationId.startsWith('sandbox-') !== (environment === 'sandbox')) {
+    return c.json({
+      error: environment === 'sandbox'
+        ? 'Ese Application ID es de producción. Elige «Producción» o pega el de Sandbox.'
+        : 'Ese Application ID es de pruebas (Sandbox). Elige «Pruebas» o pega el de producción.',
+    }, 400);
+  }
+  if (locationId && !SQUARE_LOCATION_ID.test(locationId)) return c.json({ error: 'El Location ID no es válido.' }, 400);
+  if (newToken && !SQUARE_TOKEN.test(newToken)) return c.json({ error: 'El Access Token no es válido (cópialo completo, sin espacios).' }, 400);
+
+  const current = await readSquareSettings(c.env.DATABASE_URL);
+  // A token saved for the other environment doesn't work here
+  const keepToken = !newToken && current?.environment === environment;
+  const token = newToken || (keepToken ? await storedSquareToken(c, current) : null);
+  const tokenSealed = newToken ? await seal(c.env.JWT_SECRET, newToken) : keepToken ? (current?.tokenSealed ?? '') : '';
+
+  if (body.enabled) {
+    if (!applicationId || !locationId) return c.json({ error: 'Completa el Application ID y el Location ID.' }, 400);
+    if (!token) {
+      return c.json({
+        error: current?.tokenSealed && !keepToken
+          ? 'Cambiaste de modo: pega el Access Token de ese modo.'
+          : 'Pega el Access Token de Square.',
+      }, 400);
+    }
+    if (!methods.card && !methods.googlePay && !methods.applePay) {
+      return c.json({ error: 'Activa al menos una forma de pago: tarjeta, Google Pay o Apple Pay.' }, 400);
+    }
+  }
+
+  let locationName = current?.locationId === locationId && keepToken ? current.locationName : '';
+  // Check the token against the location whenever there is something to check
+  if (token && locationId && (body.enabled || newToken)) {
+    try {
+      const location = await getLocation(environment, token, locationId);
+      if (location.currency && location.currency !== 'USD') {
+        return c.json({ error: `Esa ubicación de Square cobra en ${location.currency}; la tienda cobra en USD.` }, 400);
+      }
+      if (location.status && location.status !== 'ACTIVE') {
+        return c.json({ error: 'Esa ubicación de Square está desactivada. Actívala en Square o usa otra.' }, 400);
+      }
+      locationName = location.name ?? '';
+    } catch (err) {
+      if (err instanceof SquareApiError && (err.status === 401 || err.status === 403)) {
+        return c.json({
+          error: `Square rechazó el Access Token. Revisa que sea el de ${environment === 'sandbox' ? 'Sandbox' : 'Producción'} y que esté completo.`,
+        }, 400);
+      }
+      if (err instanceof SquareApiError && err.status === 404) {
+        return c.json({ error: 'Square no encontró ese Location ID en la cuenta de ese Access Token.' }, 400);
+      }
+      console.error('Square check failed', err);
+      return c.json({ error: 'No se pudo comprobar con Square. Intenta de nuevo en un momento.' }, 502);
+    }
+  }
+
+  const value: StoredSquare = { enabled: body.enabled, environment, applicationId, locationId, locationName, methods, tokenSealed };
+  await saveSetting(c, SQUARE_SETTINGS_KEY, value);
+  return c.json({ ok: true, locationName });
+});
+
+// Forget Square (and its token): the checkout stops offering it
+settings.delete('/square', async (c) => {
+  await getDb(c.env.DATABASE_URL).delete(settingsTable).where(eq(settingsTable.key, SQUARE_SETTINGS_KEY));
+  return c.json({ ok: true });
+});
+
+// Apple Pay only shows on domains registered with Square. The site already
+// publishes Square's verification file at
+// /.well-known/apple-developer-merchantid-domain-association.
+settings.post('/square/apple-pay-domain', async (c) => {
+  const s = await readSquareSettings(c.env.DATABASE_URL);
+  const token = await storedSquareToken(c, s);
+  if (!s || !token) return c.json({ error: 'Primero guarda los datos de Square.' }, 400);
+  const domain = new URL(siteUrl(c.env)).hostname;
+  try {
+    const result = await registerApplePayDomain(s.environment, token, domain);
+    return c.json({ ok: true, domain, status: result.status ?? 'VERIFIED' });
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    return c.json({ error: `Square no pudo registrar ${domain}: ${detail}` }, 502);
+  }
 });
 
 async function readStored(c: { env: Bindings }): Promise<{ stored: StoredSmtp | null; updatedAt: Date | null; updatedBy: string }> {
